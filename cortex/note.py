@@ -487,6 +487,13 @@ def gather(
             not note_since_ts or rendered_cutoff > note_since_ts):
         _safe(wake_state.set_last_note_ts, cfg, rendered_cutoff)
 
+    kick = None
+    try:
+        from cortex.kick import read_signal
+        kick = read_signal(cfg)
+    except Exception:
+        pass
+
     return {
         "replay_cutoff_ts": replay_cutoff_ts,
         "last_wake": last_wake,
@@ -499,6 +506,7 @@ def gather(
         "window_sid": window_sid,
         "awake_since_hm": awake_since_hm,
         "catchup_handoff_written": catchup_handoff_written,
+        "kick": kick,
     }
 
 
@@ -603,6 +611,22 @@ def render(cfg: dict, now: datetime, data: dict) -> str:
             header.append(catchup)
 
     blocks: list[str] = ["\n".join(header)]
+
+    kick = data.get("kick")
+    if kick:
+        kind = kick.get("kind", "?")
+        if kind == "reply":
+            reply_text = kick.get("text", "")
+            seg = "**Kick: reply received on TG/WX** — check outbox for fired watches."
+            if reply_text:
+                seg += f"\nHer reply: {reply_text}"
+            blocks.append(seg)
+        elif kind == "timeout":
+            blocks.append("**Kick: watch_reply timeout** — she hasn't replied; check outbox for fired watches.")
+        elif kind == "morning":
+            blocks.append("**Kick: morning flag-pull** — night mode clearing, resume day cadence.")
+        else:
+            blocks.append(f"**Kick: {kind}** — check outbox.")
 
     pending = data.get("pending") or []
     if pending:
