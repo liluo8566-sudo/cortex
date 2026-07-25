@@ -58,7 +58,7 @@ def read_signal(cfg: dict) -> dict | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cortex.kick")
     parser.add_argument("--kind", required=True,
-                        choices=["reply", "timeout", "morning", "note"])
+                        choices=["reply", "timeout", "morning", "note", "ack"])
     parser.add_argument("--note-id", type=int, default=None)
     parser.add_argument("--minutes", type=int, default=None)
     parser.add_argument("--text", default="")
@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
     state = wake_state.load(cfg)
 
-    if args.kind != "reply" and state.get("paused"):
+    if args.kind not in ("reply", "ack") and state.get("paused"):
         log.info("kick %s: DND on, skipped", args.kind)
         return 0
 
@@ -90,6 +90,14 @@ def main(argv: list[str] | None = None) -> int:
                 log.info("kick reply: injected into live session")
             else:
                 log.info("kick reply: inject failed, session may have closed")
+        elif args.kind == "ack":
+            from cortex import window
+            ack_preview = args.text[:120] if args.text else ""
+            prompt = f"[kick:ack] 她在巡山手帐上盖了「已阅」章：{ack_preview} — 去看看她读了哪一页，回应她。"
+            if window.inject_prompt(cfg, prompt):
+                log.info("kick ack: injected into live session")
+            else:
+                log.info("kick ack: inject failed, session may have closed")
         else:
             log.info("kick %s: already awake on duty, no-op", args.kind)
         return 0

@@ -625,6 +625,9 @@ def render(cfg: dict, now: datetime, data: dict) -> str:
             blocks.append("**Kick: watch_reply timeout** — she hasn't replied; check outbox for fired watches.")
         elif kind == "morning":
             blocks.append("**Kick: morning flag-pull** — night mode clearing, resume day cadence.")
+        elif kind == "ack":
+            ack_text = kick.get("text", "")
+            blocks.append(f"💌 已阅章：{ack_text}" if ack_text else "💌 已阅章")
         else:
             blocks.append(f"**Kick: {kind}** — check outbox.")
 
