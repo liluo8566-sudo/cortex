@@ -31,8 +31,10 @@ def wait(cfg: dict, minutes: float) -> dict:
     res = wake_state.commit_wait(cfg, until.isoformat(), cap)
     if not res.get("ok"):
         used = res.get("wait_count", 0)
+        inner = res.get("reason", "")
+        reason = inner or f"Wait cap reached ({used}/{cap})"
         return {"ok": False, "refused": True, "wait_count": used, "cap": cap,
-                "reason": f"Wait cap reached ({used}/{cap}) - lie_down now."}
+                "reason": f"{reason} - lie_down now."}
     return {"ok": True, "minutes": minutes, "until": until.isoformat(),
             "wait_count": res.get("wait_count"), "cap": cap}
 
