@@ -103,18 +103,14 @@ def _kick_daemon(cfg: dict, kind: str) -> bool:
 
 
 def kick(cfg: dict, kind: str, **fields) -> dict:
-    """Run one kick. `kind` (reply/timeout/morning/note/ack) selects a config
-    reason template; `fields` (id, text, minutes, ...) fill it. Returns a small
-    result dict.
+    """Run one kick. `kind` (reply/timeout/morning/note) selects a config reason
+    template; `fields` (id, text, minutes, ...) fill it. Returns a small result
+    dict.
 
     'note' (F9): a ct-targeted outbox note was just dropped — same treatment as
     any other kick (queue the reason, carrier round while awake, wake while
     asleep). The note body itself is claimed + rendered by note.py on the
     visible round; this kick only opens that round.
-
-    'ack': journal 已阅 acknowledgment — treated identically to other kinds
-    (reason queued via reason_ack template, carrier round while awake, wake
-    while asleep).
 
     Asleep -> reason flag + wake machinery (daemon kick).
     Awake (ANY kind) -> queue the reason AND mark the silence cycle's timer as
@@ -169,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Poke cortex awake to peek at a channel (watch / morning).")
     parser.add_argument("--kind", required=True,
-                        choices=("reply", "timeout", "morning", "note", "ack"),
+                        choices=("reply", "timeout", "morning", "note"),
                         help="reason template to render into the wakeup note")
     parser.add_argument("--note-id", default=None,
                         help="outbox note id (reply / timeout)")
