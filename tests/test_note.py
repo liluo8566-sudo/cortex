@@ -21,6 +21,8 @@ def cfg(tmp_path):
     # machine-origin tag is a separate first line, verified in test_wake_regime_fixes;
     # blank it here so the body assertions (startswith "Now:" / title) stay exact.
     c["note"]["wake_machine_tag"] = ""
+    # Pin timezone so assertions are host-independent (NOW is defined in MEL = UTC+10).
+    c["core"]["timezone"] = "Australia/Melbourne"
     return c
 
 
