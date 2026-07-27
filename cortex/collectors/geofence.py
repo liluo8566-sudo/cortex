@@ -20,10 +20,9 @@ from __future__ import annotations
 import re
 import sqlite3
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from cortex import db
-from cortex.config import geofence_file_path
+from cortex.config import geofence_file_path, get_tz
 
 LINE_RE = re.compile(r"^(\d{1,2}):(\d{2})\s+(.+)$")
 
@@ -89,7 +88,7 @@ def collect(conn: sqlite3.Connection, cfg: dict) -> None:
     if not path.exists():
         raise FileNotFoundError(f"geofence file not found at {path}")
 
-    tz = ZoneInfo(cfg["core"].get("timezone", "Australia/Melbourne"))
+    tz = get_tz(cfg)
     source_file = str(path)
     offset = _get_cursor(conn, source_file)
     size = path.stat().st_size

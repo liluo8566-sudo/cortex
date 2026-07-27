@@ -17,8 +17,7 @@ from pathlib import Path
 from cortex import config
 
 _AWAKE_KEYS = ("awake", "awake_since", "wake_log_id", "transcript",
-               "silence_wait_until", "wait_count", "user_replied_this_wake",
-               "tuck_pending", "last_note_ts")
+               "user_replied_this_wake", "tuck_pending", "kick_round")
 
 _LOCK_TIMEOUT_SEC = 5.0
 
@@ -33,7 +32,7 @@ class StateValidationError(Exception):
 
 def wake_state_path(cfg: dict) -> Path:
     raw = cfg["paths"].get("wake_state_file") or ""
-    return Path(raw).expanduser() if raw else config.cortex_home(cfg) / "wake_state.json"
+    return Path(raw).expanduser() if raw else config.state_dir(cfg) / "wake_state.json"
 
 
 def wakeup_note_path(cfg: dict) -> Path:
@@ -41,9 +40,27 @@ def wakeup_note_path(cfg: dict) -> Path:
     return Path(raw).expanduser() if raw else config.cortex_home(cfg) / "wakeup_note.md"
 
 
+def free_round_note_path(cfg: dict) -> Path:
+    """Staging file for the INVISIBLE free-round payload: cortex writes the
+    rendered note (and any claimed ct notes) here right before typing the short
+    ⏳ marker line, and the marrow UserPromptSubmit hook reads + consumes it on
+    the marker turn. Same bell->note pattern, so the window only ever shows the
+    marker. Must match marrow [cortex].free_round_note_file."""
+    raw = cfg["paths"].get("free_round_note_file") or ""
+    return Path(raw).expanduser() if raw else config.cortex_home(cfg) / "free_round_note.md"
+
+
 def watchdog_pidfile_path(cfg: dict) -> Path:
     raw = cfg["paths"].get("watchdog_pidfile") or ""
-    return Path(raw).expanduser() if raw else config.cortex_home(cfg) / "watchdog.pid"
+    return Path(raw).expanduser() if raw else config.state_dir(cfg) / "watchdog.pid"
+
+
+def spawn_lock_path(cfg: dict) -> Path:
+    """Exclusive flock file serialising EVERY window-spawn entrant (daemon
+    tick reconcile, ctl wake's no-resident branch, rotate succession) — see
+    wake._spawn_serialized. Default: <cortex_home>/state/spawn.lock."""
+    raw = cfg["paths"].get("spawn_lock_file") or ""
+    return Path(raw).expanduser() if raw else config.state_dir(cfg) / "spawn.lock"
 
 
 def lock_path(cfg: dict) -> Path:
@@ -288,47 +305,84 @@ def is_awake(cfg: dict) -> bool:
 
 
 def set_awake(cfg: dict, wake_log_id: int | None, transcript: str | None,
-              expected_gen: int | None = None) -> tuple[int, str] | None:
-    """Activate a wake (asleep -> awake). BUMPS gen (a fresh wake is a new epoch
-    that invalidates the sleeping window's alarm token). When `expected_gen` is
-    given the flip is CONDITIONAL: if the live gen has moved on (a newer lie_down
-    / user reset re-armed since the wake decision), abort and return None. Returns
-    the new (gen, state_id) on success, None if the conditional flip lost.
+              expected_gen: int | None = None, bump: bool = True,
+              expected_token: tuple[int, str] | None = None,
+              session_id: str | None = None,
+              cortex_claude_sid: str | None = None) -> tuple[int, str] | None:
+    """Activate a wake (asleep -> awake). BUMPS gen by default (a fresh wake is a
+    new epoch that invalidates the sleeping window's alarm token). Returns the new
+    (gen, state_id) on success, None if the conditional flip lost.
+
+    Two conditional forms (codex adversarial-review Fix 4):
+      expected_token=(gen, state_id) -- the FULL token, validated via
+        _token_current (gen AND state_id). Use this for any spawn-path caller: a
+        gen-only check tolerates the delete/recreate ABA (wake_state.json wiped
+        and recreated back to the SAME gen with a NEW state_id passes a gen-only
+        compare, letting a stale actor overwrite the recreated state -- marrow's
+        receipt consumer already validates both fields, so a gen-only cortex
+        check disagreed with marrow). Prefer this over expected_gen.
+      expected_gen=<int> -- LEGACY gen-only check, kept only for the ear path's
+        pre-existing call shape (not itself part of this fix; still gen-only by
+        design there). Superseded by expected_token when both are given.
+
+    session_id, when given, is committed in the SAME atomic section as the awake
+    flip (Fix 2): the spawn path no longer persists the new resident session id
+    separately before this CAS is known to succeed, so a stale/superseded spawn
+    can never leave its session id recorded as the resident's while a newer
+    epoch's spawn (or the prior resident) is what's actually live. None leaves
+    session_id untouched (the ear/rearm callers, which never spawn a new window).
 
     next_wake_at is the durable ledger: a successful wake means it fired, so it is
     cleared here (re-armed by the next lie_down) in the same atomic section so an
-    awake window never carries a stale scheduled time."""
+    awake window never carries a stale scheduled time. Audited (`set_awake`,
+    old->new gen) whenever it actually bumps."""
     try:
         with _strict_flock(cfg):
             d = _load_strict(cfg)
             _ensure_epoch(d)
-            if expected_gen is not None and int(d["gen"]) != int(expected_gen):
+            if expected_token is not None and not _token_current(d, expected_token):
                 return None
-            d["gen"] = int(d["gen"]) + 1
+            if expected_token is None and expected_gen is not None \
+                    and int(d["gen"]) != int(expected_gen):
+                return None
+            old_gen = int(d["gen"])
+            if bump:
+                d["gen"] = old_gen + 1
+            new_gen = d["gen"]
             d.update(awake=True, next_wake_at=None,
                      awake_since=datetime.now(timezone.utc).isoformat(),
-                     wake_log_id=wake_log_id, transcript=transcript, wait_count=0,
-                     user_replied_this_wake=False, tuck_pending=None,
-                     last_note_ts=None)
+                     wake_log_id=wake_log_id, transcript=transcript,
+                     user_replied_this_wake=False, tuck_pending=None)
+            if session_id is not None:
+                d["session_id"] = session_id
+            if cortex_claude_sid is not None:
+                d["cortex_claude_sid"] = cortex_claude_sid
             _save(cfg, d)
-            return int(d["gen"]), str(d["state_id"])
+            result = int(d["gen"]), str(d["state_id"])
     except StateValidationError:
         return None
+    if bump:
+        wake_audit(cfg, "set_awake", f"gen {old_gen}->{new_gen}", "")
+    return result
 
 
 def clear_awake(cfg: dict) -> None:
     """Clear the awake marker AND bump gen (a successful sleep is a new epoch —
-    any alarm token from the just-ended wake is invalidated). Strict-locked."""
+    any alarm token from the just-ended wake is invalidated). Strict-locked.
+    Audited (`clear_awake`, old->new gen)."""
     try:
         with _strict_flock(cfg):
             d = _load_strict(cfg)
             _ensure_epoch(d)
-            d["gen"] = int(d["gen"]) + 1
+            old_gen = int(d["gen"])
+            d["gen"] = old_gen + 1
+            new_gen = d["gen"]
             for k in _AWAKE_KEYS:
                 d.pop(k, None)
             _save(cfg, d)
     except StateValidationError:
-        pass
+        return
+    wake_audit(cfg, "clear_awake", f"gen {old_gen}->{new_gen}", "")
 
 
 def claim_lie_down(cfg: dict, force_slept: str | None = None) -> dict | None:
@@ -364,16 +418,14 @@ def claim_lie_down(cfg: dict, force_slept: str | None = None) -> dict | None:
 
 def user_replied_this_wake(cfg: dict) -> bool:
     """True once a real user message landed in the current wake (set by the
-    marrow UserPromptSubmit hook). Drives the chat vs no-user silence tier."""
+    marrow UserPromptSubmit hook). Selects which timestamp source the unified
+    silence_action idle bar times from (user message vs awake_since)."""
     return bool(load(cfg).get("user_replied_this_wake"))
 
 
-def awake_since_min(cfg: dict) -> float | None:
-    """Minutes elapsed since this wake began (awake_since), or None when not
-    awake / unparseable. The no-user silence tier times from HERE (elapsed since
-    wake), not from a user-message ts that may never exist on a fresh wake where
-    the user never spoke."""
-    raw = load(cfg).get("awake_since")
+def _age_min_or_none(raw) -> float | None:
+    """Minutes since an ISO timestamp held in the state, or None when the field
+    is absent/unparseable. Naive timestamps read as UTC (the writers' format)."""
     if not raw:
         return None
     try:
@@ -385,101 +437,116 @@ def awake_since_min(cfg: dict) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
 
 
-def commit_wait(cfg: dict, until_iso: str, cap: int) -> dict:
-    """Accept one wait() as a single atomic strict-locked mutation: verify the
-    session is still awake and under cap, BUMP gen (an accepted wait is a new
-    epoch — it re-arms the silence window, invalidating the prior alarm token),
-    set silence_wait_until, increment wait_count, clear tuck_pending. Returns
-    {"ok": bool, ...}. Never raises: a lock/parse failure returns ok=False,
-    refused=True (fail closed — no half-applied wait)."""
+def awake_since_min(cfg: dict) -> float | None:
+    """Minutes elapsed since this wake began (awake_since), or None when not
+    awake / unparseable. When the user never spoke this wake, silence_action
+    times the same idle bar from HERE instead of a user-message ts that may
+    never exist."""
+    return _age_min_or_none(load(cfg).get("awake_since"))
+
+
+def last_user_msg_min(cfg: dict) -> float | None:
+    """Minutes since the last real user message, as stamped into the state by
+    the marrow UserPromptSubmit hook (last_user_msg_ts). Written synchronously
+    with the prompt, unlike the transcript read which only sees the message once
+    claude has flushed it to the jsonl."""
+    return _age_min_or_none(load(cfg).get("last_user_msg_ts"))
+
+
+def silence_basis_min(cfg: dict, transcript_min: float | None) -> float:
+    """The ONE silence basis for the free-round cycle, shared by the watchdog
+    poll and the daemon business deadline.
+
+    `transcript_min` is the transcript-derived value (transcript.user_silent_min)
+    and it LAGS: the marrow UserPromptSubmit hook stamps last_user_msg_ts and
+    drops tuck_pending (the cycle's only other gate) in one write, before the
+    message reaches the jsonl. A transcript-only basis therefore still reports
+    the PREVIOUS message's age for seconds after a user arrival, with the gate
+    already gone -> a free round fires immediately on top of the user's message.
+    Take the newest (smallest) of the two sources.
+
+    No user message this wake -> awake_since, so the same bar still elapses.
+    Nothing known -> 0.0 (hold), the pre-existing unreadable-transcript
+    behaviour: the window is a MINIMUM, never fire on an unknown basis."""
+    d = load(cfg)
+    if not d.get("user_replied_this_wake"):
+        elapsed = _age_min_or_none(d.get("awake_since"))
+        if elapsed is not None:
+            return elapsed
+    known = [v for v in (transcript_min, _age_min_or_none(d.get("last_user_msg_ts")))
+             if v is not None]
+    return min(known) if known else 0.0
+
+
+def stamp_silence_basis(cfg: dict) -> bool:
+    """Re-arm the free-round cycle from NOW without delivering anything (stamp
+    the tuck_pending last-injection marker). Used when a deadline is found
+    already overdue at daemon start: the window is a minimum interval, so an
+    expiry that elapsed while nothing was running must restart the cycle rather
+    than fire on the spot. Awake-only. Returns True on stamp."""
+    with _flock(cfg):
+        d = load(cfg)
+        if not d.get("awake"):
+            return False
+        d["tuck_pending"] = datetime.now(timezone.utc).isoformat()
+        _save(cfg, d)
+        return True
+
+
+def mark_kick_round(cfg: dict) -> bool:
+    """External-wake carrier primitive (kick.py replacement for the retired
+    wait-expiry ride): stamp kick_round=True under the strict lock so the next
+    silence_action poll (watchdog / tick awake gate) treats the silence timer as
+    immediately elapsed and injects a free-round note NOW, regardless of
+    silent_min. Only stamps while awake with no kick_round already pending
+    (idempotent — a second kick before the first is consumed is a no-op).
+    Returns True on a fresh stamp, False otherwise (not awake / already
+    pending / lock failure)."""
     try:
         with _strict_flock(cfg):
             d = _load_strict(cfg)
             _ensure_epoch(d)
             if not d.get("awake"):
-                return {"ok": False, "refused": True, "reason": "not awake",
-                        "wait_count": int(d.get("wait_count") or 0), "cap": cap}
-            try:
-                used = int(d.get("wait_count", 0) or 0)
-            except (TypeError, ValueError):
-                used = 0
-            if cap > 0 and used >= cap:
-                return {"ok": False, "refused": True, "wait_count": used,
-                        "cap": cap}
-            old_gen = int(d["gen"])
-            d["gen"] = old_gen + 1
-            new_gen = d["gen"]
-            d["silence_wait_until"] = until_iso
-            count = used + 1
-            d["wait_count"] = count
-            d.pop("tuck_pending", None)
+                return False
+            if d.get("kick_round"):
+                return False
+            d["kick_round"] = True
             _save(cfg, d)
+            return True
     except StateValidationError:
-        return {"ok": False, "refused": True, "reason": "state locked",
-                "wait_count": 0, "cap": cap}
-    # Audit OUTSIDE the strict lock (parity with claim_lie_down): an accepted
-    # wait bumps gen — a new cancellation epoch that must be visible in the
-    # trail (a silent bump hid the wait during incident forensics).
-    wake_audit(cfg, "commit_wait", f"gen {old_gen}->{new_gen}",
-               f"until={until_iso} count={count}")
-    return {"ok": True, "wait_count": count, "cap": cap}
+        return False
 
 
-def set_wait_until(cfg: dict, until_iso: str) -> None:
-    """Declare a one-shot silence window: the watchdog holds off its routine
-    timeout lie-down until this UTC instant (the model is e.g. waiting for the
-    user to come back). Cleared once the watchdog acts on it (take_wait_until)."""
-    update(cfg, silence_wait_until=until_iso)
-
-
-def get_wait_until(cfg: dict) -> datetime | None:
-    """Peek the declared silence deadline (UTC-aware) or None — the watchdog
-    reads this every poll: still-future = keep holding; past/absent = the
-    routine silent_max_min threshold applies. Non-destructive; the watchdog
-    calls clear_wait_until() once it acts, so the extension fires only once."""
-    raw = load(cfg).get("silence_wait_until")
-    if raw is None:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def clear_wait_until(cfg: dict) -> None:
-    """Reset the silence window to default (no permanent extension)."""
+def take_kick_round(cfg: dict) -> bool:
+    """Consume the kick_round marker (read-and-clear, advisory lock). True if it
+    was pending. silence_action calls this once it has decided to act on it, so
+    the carrier fires exactly once per kick."""
     with _flock(cfg):
         d = load(cfg)
-        if d.pop("silence_wait_until", None) is not None:
+        val = bool(d.pop("kick_round", None))
+        if val:
             _save(cfg, d)
+        return val
 
 
-def get_last_note_ts(cfg: dict) -> str | None:
-    """ISO timestamp baseline for the diff-mode Replay section: the newest
-    replayed event's ts as of the last rendered note (wake's initial note or
-    any free-round tuck-in). None = no note rendered yet this wake -> full
-    (epoch-zero) replay."""
-    v = load(cfg).get("last_note_ts")
-    return str(v) if v else None
+def peek_kick_round(cfg: dict) -> bool:
+    """Non-destructive read of the kick_round marker."""
+    return bool(load(cfg).get("kick_round"))
 
 
-def set_last_note_ts(cfg: dict, ts_iso: str) -> None:
-    update(cfg, last_note_ts=ts_iso)
-
-
-def get_wait_count(cfg: dict) -> int:
-    """How many wait() calls have fired this wake (reset on wake start /
-    lie_down). Absent -> 0."""
-    try:
-        return int(load(cfg).get("wait_count", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
+def clear_kick_round(cfg: dict) -> None:
+    """Drop the kick_round marker without consuming it as a fire (e.g. an
+    interrupt kick replacing a still-pending carrier). Best-effort no-op when
+    unset."""
+    with _flock(cfg):
+        d = load(cfg)
+        if d.pop("kick_round", None) is not None:
+            _save(cfg, d)
 
 
 def set_next_wake_at(cfg: dict, iso_local: str | None) -> None:
     """Persist the scheduled next-wake instant (local ISO) as the durable ledger.
-    The scheduled time must never live only in the sentinel process args: a
+    The scheduled time must never live only in a process's args: a
     compact/kill loses those, but this survives so the tick reconcile can fire an
     overdue wake. None clears it (e.g. paused, or no schedule)."""
     if iso_local is None:
@@ -501,33 +568,33 @@ def clear_next_wake_at(cfg: dict) -> None:
     set_next_wake_at(cfg, None)
 
 
-def set_paused(cfg: dict, paused: bool) -> None:
-    """DND flag: tick reconcile, watchdog, sentinel-fire and injections all
-    respect it (no reaps, no wakes, no injections while paused). On unpause,
-    overdue ledger alarms fire via the next reconcile."""
-    if paused:
-        update(cfg, paused=True)
-    else:
-        with _flock(cfg):
-            d = load(cfg)
-            if d.pop("paused", None) is not None:
-                _save(cfg, d)
-
-
-def is_paused(cfg: dict) -> bool:
-    return bool(load(cfg).get("paused"))
+# The old per-shell `paused` DND flag lived here. It is gone: the circuit
+# breaker (cortex.breaker, <marrow config dir>/breaker.json) is now the single
+# truth for "cortex autonomous activity is held", shared with the tg shell and
+# surviving restarts. Readers call breaker.holds(cfg, "cli").
 
 
 def set_rotated(cfg: dict) -> None:
     """Rotate flag: lie_down sets it when the window grew past the rotate line so
-    the NEXT pacemaker wake respawns a fresh window (SIGTERM claude + fresh spawn)
+    the NEXT wake respawns a fresh window (SIGTERM claude + fresh spawn)
     instead of resuming the oversized one."""
     update(cfg, rotated=True)
 
 
+def peek_rotated(cfg: dict) -> bool:
+    """Non-destructive read of the rotate flag. Used to CLASSIFY a wake as fresh
+    without consuming the one-shot flag: the flag must survive until the fresh
+    successor is verified live, so a failed spawn keeps retry ownership (consuming
+    it during classification, before the spawn succeeded, let a failed spawn drop
+    the flag -> the retiring conversation got reactivated on the next wake, Fix 1).
+    Consume with take_rotated only AFTER the successor is confirmed."""
+    return bool(load(cfg).get("rotated"))
+
+
 def take_rotated(cfg: dict) -> bool:
     """Consume the rotate flag (read-and-clear). True = last lie_down asked the
-    next wake to respawn the window fresh."""
+    next wake to respawn the window fresh. Called only AFTER a fresh successor is
+    verified live (Fix 1) so a spawn failure never strands the retired window."""
     with _flock(cfg):
         d = load(cfg)
         val = bool(d.pop("rotated", False))
@@ -550,30 +617,3 @@ def set_retired_sid(cfg: dict, transcript_path: str | None) -> None:
 
 def get_retired_sid(cfg: dict) -> str | None:
     return load(cfg).get("retired_sid")
-
-
-def get_sentinel_pid(cfg: dict) -> int | None:
-    """Recorded pid of the one-shot exact-time wake sentinel (cortex.sentinel),
-    or None. Every new lie_down kills this predecessor before arming a fresh one."""
-    try:
-        v = load(cfg).get("sentinel_pid")
-        return int(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def set_sentinel_pid(cfg: dict, pid: int) -> None:
-    update(cfg, sentinel_pid=pid)
-
-
-def clear_sentinel_pid(cfg: dict, only_if_pid: int | None = None) -> None:
-    """Drop the recorded sentinel pid. only_if_pid = self-guard: the sentinel
-    clears its own record only when it still matches (a newer lie_down may have
-    already re-armed a different pid). None = unconditional clear."""
-    with _flock(cfg):
-        d = load(cfg)
-        cur = d.get("sentinel_pid")
-        if only_if_pid is not None and cur is not None and int(cur) != int(only_if_pid):
-            return
-        if d.pop("sentinel_pid", None) is not None:
-            _save(cfg, d)

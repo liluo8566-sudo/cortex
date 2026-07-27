@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, tzinfo
 
 from cortex import db
-from cortex.config import knowledgec_db_path
+from cortex.config import knowledgec_db_path, get_tz
 
 COREDATA_EPOCH_OFFSET = 978307200  # 2001-01-01T00:00:00Z in Unix seconds
 
@@ -27,7 +26,7 @@ def _open_readonly(path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True)
 
 
-def _local_date(unix_ts: float, tz: ZoneInfo) -> str:
+def _local_date(unix_ts: float, tz: tzinfo) -> str:
     return datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone(tz).date().isoformat()
 
 
@@ -45,7 +44,7 @@ def read_usage_rows(conn: sqlite3.Connection, stream_name: str) -> list[tuple[st
     return rows
 
 
-def aggregate(rows: list[tuple[str, float, float]], tz: ZoneInfo, categories: dict[str, str]) -> tuple[dict, dict]:
+def aggregate(rows: list[tuple[str, float, float]], tz: tzinfo, categories: dict[str, str]) -> tuple[dict, dict]:
     """Aggregate seconds per (date, bundle_id) and (date, category)."""
     app_seconds: dict[tuple[str, str], float] = defaultdict(float)
     for bundle_id, start_unix, end_unix in rows:
@@ -71,7 +70,7 @@ def collect(marrow_conn: sqlite3.Connection, cfg: dict) -> None:
 
     stream_name = cfg["knowledgec"].get("stream_name", "/app/usage")
     categories = cfg["knowledgec"].get("categories", {})
-    tz = ZoneInfo(cfg["core"].get("timezone", "Australia/Melbourne"))
+    tz = get_tz(cfg)
 
     kc_conn = _open_readonly(kc_path)
     try:

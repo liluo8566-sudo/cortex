@@ -18,7 +18,7 @@ def cfg(tmp_path):
 
 
 def test_save_is_atomic_no_tmp_left(cfg):
-    wake_state.update(cfg, awake=True, wait_count=3)
+    wake_state.update(cfg, awake=True)
     p = wake_state.wake_state_path(cfg)
     assert p.exists()
     # No stray temp files from the atomic replace.
@@ -31,38 +31,25 @@ def test_lock_file_path_is_sibling(cfg):
     assert lp == wake_state.wake_state_path(cfg).with_suffix(".lock")
 
 
-def test_commit_wait_writes_audit_line(cfg):
-    """An accepted wait bumps gen (a new cancellation epoch) — it must leave a
-    commit_wait audit line (old->new gen) so the bump is visible in forensics,
-    mirroring lie_down_claim. A refused wait writes nothing."""
-    wake_state.set_awake(cfg, 1, None)  # awake, gen bumped, wait_count 0
-    gen_before = wake_state.current_epoch(cfg)[0]
-    res = wake_state.commit_wait(cfg, "2099-01-01T00:00:00+00:00", cap=0)
-    assert res["ok"] is True
-    lines = wake_state.config.wake_audit_log_path(cfg).read_text().splitlines()
-    commits = [ln for ln in lines if "\tcommit_wait\t" in ln]
-    assert len(commits) == 1
-    assert f"gen {gen_before}->{gen_before + 1}" in commits[0]
+def test_mark_kick_round_once_then_take(cfg):
+    """External-wake carrier primitive: marks only while awake, idempotent (a
+    second mark before consumption is a no-op), and take_kick_round consumes it
+    exactly once."""
+    wake_state.set_awake(cfg, 1, None)
+    assert wake_state.mark_kick_round(cfg) is True
+    assert wake_state.mark_kick_round(cfg) is False  # already pending -> no-op
+    assert wake_state.peek_kick_round(cfg) is True
+    assert wake_state.take_kick_round(cfg) is True
+    assert wake_state.peek_kick_round(cfg) is False
+    assert wake_state.take_kick_round(cfg) is False  # already consumed
 
 
-def test_commit_wait_refused_writes_no_audit(cfg):
-    """A refused wait (not awake) does not bump gen -> no commit_wait audit line."""
-    wake_state.update(cfg, awake=None)  # not awake
-    res = wake_state.commit_wait(cfg, "2099-01-01T00:00:00+00:00", cap=0)
-    assert res["ok"] is False
-    p = wake_state.config.wake_audit_log_path(cfg)
-    lines = p.read_text().splitlines() if p.exists() else []
-    assert not any("\tcommit_wait\t" in ln for ln in lines)
+def test_mark_kick_round_noop_when_asleep(cfg):
+    wake_state.update(cfg, awake=None)
+    assert wake_state.mark_kick_round(cfg) is False
+    assert wake_state.peek_kick_round(cfg) is False
 
 
-def test_sentinel_pid_self_guarded_clear(cfg):
-    wake_state.set_sentinel_pid(cfg, 500)
-    # Clearing with a mismatched pid is a no-op (a newer arm owns the record).
-    wake_state.clear_sentinel_pid(cfg, only_if_pid=999)
-    assert wake_state.get_sentinel_pid(cfg) == 500
-    # Matching pid clears it.
-    wake_state.clear_sentinel_pid(cfg, only_if_pid=500)
-    assert wake_state.get_sentinel_pid(cfg) is None
 
 
 def test_lie_down_cli_requires_next_wake_min(cfg, monkeypatch):

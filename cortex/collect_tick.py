@@ -15,9 +15,8 @@ _DAYBRIEF_TIMEOUT_S = 20
 
 def _run_usage_snapshot(conn, cfg: dict) -> None:
     """Spawn marrow's own venv python to run `python -m marrow.usage_snapshot`
-    (OAuth usage % -> ct_rate_limit kv). Same own-venv-subprocess pattern as
-    wake.py:call_marrow_cortex (marrow has its own deps, cortex never imports
-    it in-process). Best-effort: never raises, never blocks the tick — logs
+    (OAuth usage % -> ct_rate_limit kv). Own-venv subprocess — marrow has its
+    own deps, cortex never imports it in-process. Best-effort: never raises, never blocks the tick — logs
     failure to ct_collector_log like the other collectors."""
     if not cfg.get("tick", {}).get("usage_snapshot", True):
         return

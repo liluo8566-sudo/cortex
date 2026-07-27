@@ -19,7 +19,7 @@ def _live_fallback_cfg():
 
 @pytest.mark.parametrize("resolve", [
     lambda c: config.cortex_home(c),
-    lambda c: config.wake_signal_log_path(c),
+    lambda c: config.state_dir(c),
     lambda c: config.wake_audit_log_path(c),
     lambda c: config.wake_timing_log_path(c),
     lambda c: wake_state.wake_state_path(c),
@@ -39,6 +39,5 @@ def test_barrier_allows_tmp_isolated_paths(tmp_path):
          "wake": {}}
     # None of these raise: all resolve under tmp_path.
     assert str(config.cortex_home(c)).startswith(str(tmp_path))
-    assert str(config.wake_signal_log_path(c)).startswith(str(tmp_path))
     assert str(wake_state.wake_state_path(c)).startswith(str(tmp_path))
     assert str(config.wake_timing_log_path(c)).startswith(str(tmp_path))

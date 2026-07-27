@@ -81,8 +81,8 @@ _LINEAGE_MARKER_PREFIX_CHARS = 24
 
 def newest_window_lineage(cfg: dict, marker: str) -> Path | None:
     """The newest session jsonl in the transcript dir whose FIRST user message
-    carries the wake signal marker (config wake.wake_signal_marker, e.g.
-    '[CORTEX-WAKE]') within its first _LINEAGE_MARKER_PREFIX_CHARS chars — i.e.
+    carries the wake bell prefix marker (config wake.wake_bell_template prefix,
+    e.g. '☀️') within its first _LINEAGE_MARKER_PREFIX_CHARS chars — i.e.
     a genuine window-lineage session (every cortex window since dccb3d4 is
     launched with the marker baked into its first prompt), not a headless
     one-shot (marrow's sessionend digest also runs `claude -p` against this
@@ -135,12 +135,26 @@ def resident_transcript(cfg: dict) -> Path | None:
         p = Path(str(raw)).expanduser()
         if p.exists():
             return p
-    marker = str(cfg.get("wake", {}).get("wake_signal_marker") or "").strip()
+    marker = lineage_marker(cfg)
     if marker:
         lineage = newest_window_lineage(cfg, marker)
         if lineage is not None:
             return lineage
     return newest(cfg)
+
+
+def lineage_marker(cfg: dict) -> str:
+    """Marker leading a genuine cortex window's first prompt = the spawn-opener
+    template prefix (e.g. '☀️'; window.fresh_initial_prompt)."""
+    wcfg = cfg.get("wake", {})
+    return str(wcfg.get("spawn_opener_template") or "☀️ {hm}").split("{hm}", 1)[0].strip()
+
+
+def bell_marker(cfg: dict) -> str:
+    """Prefix of the bell TYPED into a live resident window
+    ([wake].wake_bell_template) — a machine line, never user speech."""
+    wcfg = cfg.get("wake", {})
+    return str(wcfg.get("wake_bell_template") or "⏰ {hm}").split("{hm}", 1)[0].strip()
 
 
 # Leading decoration tolerated before a machine marker: whitespace + at most a
@@ -153,14 +167,19 @@ _MARKER_LEAD_RE = re.compile(
 
 
 def _line_starts_with_marker(text: str, markers: list[str]) -> bool:
-    """True iff ANY line of *text* begins with a machine marker after a tolerated
-    leading decoration run. Machine writes (wake bell '<emoji> [CORTEX-WAKE] …',
-    tuck-in block whose final line is '⏳ [NEW ROUND] …') always line-start their
-    marker; a real user message merely quoting one mid-sentence never matches, so
-    it still resets the silence timer (zero false positives on real speech)."""
+    """True iff ANY line of *text* begins with a machine marker, tried RAW first
+    (so an emoji-leading marker — e.g. the bell prefix '☀️' or a multi-codepoint
+    ZWJ template like '🧚‍♀️' — matches itself directly) and only if that
+    misses, after a tolerated leading decoration run is stripped (so a TEXT
+    marker like '[NEW ROUND]' still matches past a machine-written emoji lead,
+    e.g. '⏳ [NEW ROUND] …'). A real user message merely quoting a marker
+    mid-sentence never matches either path, so it still resets the silence
+    timer (zero false positives on real speech)."""
     if not markers:
         return False
     for line in text.splitlines() or [text]:
+        if any(line.startswith(mk) for mk in markers):
+            return True
         head = _MARKER_LEAD_RE.sub("", line, count=1)
         if any(head.startswith(mk) for mk in markers):
             return True
@@ -175,9 +194,11 @@ def _line_markers(cfg: dict) -> list[str]:
     is_machine_line (cortex_bridge.py): wake marker + tuck-in marker family."""
     wcfg = cfg.get("wake", {})
     out = []
-    m = str(wcfg.get("wake_signal_marker") or "").strip()
-    if m:
-        out.append(m)
+    # Visible prefixes of both machine wake lines: the fresh-spawn opener
+    # (lineage_marker) and the bell typed into a live resident (bell_marker).
+    for m in (lineage_marker(cfg), bell_marker(cfg)):
+        if m and m not in out:
+            out.append(m)
     for m in wcfg.get("machine_line_markers") or config.DEFAULT_MACHINE_LINE_MARKERS:
         m = str(m).strip()
         if m and m not in out:
@@ -225,8 +246,8 @@ def _entry_ts(o: dict) -> float | None:
 def last_user_message_mtime(cfg: dict) -> float | None:
     """Epoch-seconds timestamp of the LAST real user message in the current
     transcript, tail-read (never loads the whole file). Assistant turns, system
-    writes and the ear-delivered injections (wake bell / tuck-in / free-round /
-    night lines — `_line_markers`) do NOT count: those are machine writes that
+    writes and the ear-delivered injections (wake bell / tuck-in / free-round
+    lines — `_line_markers`) do NOT count: those are machine writes that
     must not reset the silence timer (the "永远睡不到alarm" bug family). Returns
     None when no qualifying user message is found or the transcript is
     missing/unreadable — callers fall back to hold behaviour.
@@ -285,10 +306,74 @@ def _scan_last_user_ts(chunk: bytes, markers: list[str]) -> float | None:
 def user_silent_min(cfg: dict) -> float | None:
     """Minutes since the last real user message (`last_user_message_mtime`), or
     None when it cannot be determined. The single silence source shared by the
-    watchdog poll and the tick awake gate."""
+    watchdog poll and the tick awake gate. WINDOW-LOCAL: reads only the resident
+    cortex transcript. For all-channel silence use `global_user_silent_min`."""
     import time
     ts = last_user_message_mtime(cfg)
     return (time.time() - ts) / 60.0 if ts is not None else None
+
+
+def _marrow_db_last_user_ts(cfg: dict) -> float | None:
+    """Epoch seconds of the LAST user message across ALL channels (cli/tg/wx/ct),
+    read from marrow's events table READ-ONLY. Machine/injected lines are already
+    excluded at marrow's ingestion (transcript.rows_from_records drops harness +
+    machine-marker rows), so `role='user'` is a genuine user turn on every
+    channel. `timestamp` is ISO-8601 UTC (e.g. '2026-07-19T16:18:35.959Z').
+
+    Returns None on ANY failure — missing db file, locked, schema mismatch, no
+    user rows, or an unparseable timestamp. None is the caller's "unknown" and
+    must NEVER be silently substituted by a window-local source (that reintroduces
+    the window-only-silence bug)."""
+    import sqlite3
+    from datetime import datetime
+
+    db_path = config.marrow_db_path(cfg)
+    if not db_path.exists():
+        return None
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT timestamp FROM events WHERE role='user' "
+            "ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    raw = str(row[0]).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def global_user_silent_min(cfg: dict) -> float | None:
+    """Minutes since the last user message across ALL channels (marrow db). The
+    user active on cli/tg/wx must not be judged silent just because THIS cortex
+    window's own transcript is quiet.
+
+    result = minutes since max(marrow-db last user ts, resident-transcript last
+    user ts). The transcript term can only SHORTEN silence, never substitute for
+    the db: if the marrow-db query fails (missing / locked / schema mismatch /
+    no rows / bad ts) return None so the caller holds — NEVER fall back to
+    transcript-only (that silently reintroduces the window-only-silence bug)."""
+    import time
+    db_ts = _marrow_db_last_user_ts(cfg)
+    if db_ts is None:
+        return None
+    tx_ts = last_user_message_mtime(cfg)
+    latest = db_ts if tx_ts is None else max(db_ts, tx_ts)
+    return (time.time() - latest) / 60.0
 
 
 def window_tokens(cfg: dict) -> int:

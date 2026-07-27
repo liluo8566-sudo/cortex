@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cortex"
 version = "0.1.0"
-description = "Awake-presence layer: collectors -> pacemaker -> resident session."
-requires-python = ">=3.11"
+description = "Awake-presence layer: collectors -> wake daemon -> resident session."
+requires-python = ">=3.12"
 # Standard library only (tomllib requires 3.11+). No third-party runtime deps.
 dependencies = []
 
 [tool.setuptools]
-packages = ["cortex", "cortex.collectors", "cortex.pacemaker"]
+packages = ["cortex", "cortex.collectors"]

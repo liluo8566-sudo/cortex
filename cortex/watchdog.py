@@ -1,9 +1,11 @@
 """Per-wake watchdog: spawned at note injection, killed at lie_down, never
 resident. Every poll_sec it reads the transcript (mtime + window tokens) and
 the awake marker, applying two judgements:
-  (b) silent past silent_max_min without lie_down -> proxy lie_down (timeout).
-      The routine end: user replies keep the transcript mtime fresh, so an
-      active conversation never times out mid-turn.
+  (b) silent past silent_max_min -> type ONE short free-round marker line (the
+      rendered note rides invisibly: staged to free_round_note_path, injected by
+      the marrow hook on that marker turn) and re-arm the same timer (perpetual
+      cycle, never forces sleep). User replies keep the transcript mtime fresh,
+      so an active conversation never elapses.
   (c) window tokens >= fuse -> esc, then prompt the session to write its
       handoff and lie_down(rotate=True), give it a bounded grace window
       (fuse_handoff_grace_sec) to do so itself, else force it down (fuse).
@@ -24,8 +26,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from cortex import config, db, transcript, wake_state, window
-from cortex.pacemaker import integration
+from cortex import (
+    breaker, config, db, occupancy, transcript, wake_state, window,
+)
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -105,10 +108,10 @@ def _spawn_lock(cfg: dict):
 
 def spawn(cfg: dict) -> int | None:
     """Launch a detached per-wake watchdog process (`python -m cortex.watchdog`)
-    that outlives the pacemaker tick. Singleton guard (permanent-residency
+    that outlives one daemon reconcile pass. Singleton guard (permanent-residency
     invariant): if the recorded pidfile still names a LIVE watchdog, do NOT spawn
     a second — return its pid. Only an absent/dead record spawns a fresh one. This
-    is the single choke point behind every set_awake caller (fresh / ear / rearm)
+    is the single choke point behind every set_awake caller (fresh / typed bell)
     and marrow's _spawn_watchdog_if_absent, so a re-wake of an already-resident
     window never leaks a duplicate watchdog. Returns the live/new pid.
 
@@ -163,11 +166,55 @@ def _verify_esc_or_hard_interrupt(cfg: dict, grace_sec: float, trigger: str) -> 
     return f"hard-interrupt:{trigger} pid={pid}"
 
 
-_DEFAULT_FUSE_PROMPT = (
-    "⚙️ [FUSE] Summarise this whole session into one section and append it to "
-    "handoff.md — follow the format and style of the preceding sections. Call "
-    "lie_down(rotate=True) when done."
-)
+def _announce_trip(cfg: dict, message: str) -> None:
+    """A tripped breaker must reach the human: a marrow `alerts` row (surfaced
+    on the monitor page) plus a pending outbox note for the tg bridge to
+    deliver. Both are raw writes into marrow.db — the same shape cortex already
+    uses for its respawn alert; nothing is imported across repos. Best-effort:
+    a failed announcement must never keep the breaker from standing."""
+    try:
+        conn = db.connect(cfg)
+    except Exception:  # noqa: BLE001 — db unreachable: the breaker still holds
+        _log("breaker trip: marrow db unreachable, announcement skipped")
+        return
+    try:
+        conn.execute(
+            "INSERT INTO alerts (severity, type, message, source) VALUES (?, ?, ?, ?)",
+            ("critical", "cortex_breaker_tripped", message, "cortex.watchdog"),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — table may be absent
+        _log("breaker trip: alert row write failed")
+    try:
+        conn.execute(
+            "INSERT INTO outbox (from_sid, from_channel, target, body)"
+            " VALUES (?, ?, ?, ?)",
+            (None, "cortex", "tg", message),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — outbox may be absent
+        _log("breaker trip: outbox note write failed")
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def _record_fuse(cfg: dict) -> None:
+    """Tally this cli fuse in the shared rolling window and, on a threshold
+    breach, trip the breaker for ALL shells. Never raises — a fuse must still
+    run its handoff/lie_down ladder even if the tally file is unwritable."""
+    try:
+        cfg_dir = config.marrow_config_dir(cfg)
+        count, tripped = breaker.record_fuse_and_maybe_trip(cfg_dir, "cli")
+    except Exception as e:  # noqa: BLE001
+        _log(f"breaker: fuse tally failed ({e})")
+        return
+    _log(f"breaker: fuse recorded (cli), {count} in window")
+    if tripped is None:
+        return
+    message = breaker.trip_message(cfg_dir, count, tripped["scope"])
+    _log(f"breaker TRIPPED scope={tripped['scope']} reason={tripped['reason']}")
+    _announce_trip(cfg, message)
 
 
 def _fuse(cfg: dict, grace: float) -> None:
@@ -177,18 +224,26 @@ def _fuse(cfg: dict, grace: float) -> None:
     reaction, fall back to the force path (SIGINT esc-equivalent + proxy
     lie_down); force_slept is set only when the handoff was NOT written this
     grace phase, so the catchup marker fires exactly when the handoff is missing.
-    Hard deadline on the whole grace phase — the fuse must never hang."""
+    Hard deadline on the whole grace phase — the fuse must never hang.
+
+    Covert delivery: only the "⚙️ [FUSE]" marker reaches the window (bell via the
+    typed into the window). The full FUSE instruction body is
+    injected invisibly by the marrow hook keyed on the marker ([cortex].fuse_prompt_text)."""
     from cortex import lie_down as lie_down_mod
 
     wcfg = cfg["wake"].get("watchdog", {})
     handoff_grace = float(wcfg.get("fuse_handoff_grace_sec", 300))
-    prompt = wcfg.get("fuse_handoff_prompt") or _DEFAULT_FUSE_PROMPT
+    marker_line = str(cfg["wake"].get("fuse_marker") or "⚙️ [FUSE]").strip()
+
+    # Tally at fire time (before the long grace phase), so a fuse that hangs or
+    # crashes mid-ladder still counts towards the breaker.
+    _record_fuse(cfg)
 
     window.send_esc(cfg)
-    time.sleep(1.0)  # let esc land before typing the prompt
+    time.sleep(1.0)  # let esc land before delivering the marker
     handoff = config.handoff_path(cfg)
     before_mtime = handoff.stat().st_mtime if handoff.exists() else None
-    window.inject_prompt(cfg, prompt)
+    window.deliver_covert_marker(cfg, marker_line)
 
     # Poll for the session to lie down on its own (awake marker cleared) within
     # the grace window. Hard deadline = handoff_grace from now.
@@ -220,261 +275,244 @@ def _handoff_written(handoff, before_mtime: float | None) -> bool:
         return False
 
 
-def _wait_until_live(cfg: dict) -> bool:
-    """True if a one-shot silence window (cortex.wait) is still in the future.
-    A live wait_until holds off every silence action (tuck-in / auto sleep)."""
-    wu = wake_state.get_wait_until(cfg)
-    return wu is not None and datetime.now(timezone.utc) < wu
-
-
-def _free_round_note(cfg: dict) -> tuple[str, str | None]:
-    """Freshly rendered wakeup note for a free-round tuck-in (silence-gate OR
-    wait-expiry — every free-round injection carries one, D6). Returns
-    (text, pending_baseline_ts): text is "" when the toggle is off / render
-    fails; pending_baseline_ts is the newest eligible replay ts that the caller
-    must persist as the new diff baseline ONLY AFTER the tuck-in write + epoch
-    commit succeed (FIX 6 — advancing it during render lost replay events forever
-    when a stale-epoch / failed write dropped the injection). Diff mode: gather
-    replays only events newer than the wake's last rendered note. Never raises —
-    the tuck-in must land regardless."""
-    if not cfg["wake"].get("wait_expiry_note", True):
-        return "", None
+def _free_round_note(cfg: dict) -> str:
+    """Freshly rendered wakeup note for a free-round injection (silence-cycle OR
+    kick carrier — every free-round injection carries one). "" when the toggle is
+    off or the render fails. Carries no Replay section: the marker line lands as
+    a user-prompt turn, so marrow's turn_inject is that window's replay outlet.
+    Never raises — the injection must land regardless."""
+    if not cfg["wake"].get("free_round_note", True):
+        return ""
     try:
         from datetime import datetime
         from pathlib import Path
-        from zoneinfo import ZoneInfo
         from cortex import note
 
-        tz = ZoneInfo(cfg.get("core", {}).get("timezone", "Australia/Melbourne"))
-        now = datetime.now(tz)
+        now = datetime.now(config.get_tz(cfg))
         sid = None
         raw = wake_state.load(cfg).get("transcript")
         if raw:
             sid = Path(str(raw)).stem[:8]
         conn = db.connect(cfg)
         try:
-            # advance_baseline=False: render must NOT persist the baseline. The
-            # caller advances it only after the injection is committed.
-            data = note.gather(conn, cfg, now, window_sid=sid,
-                               advance_baseline=False)
+            # claim_ct_notes=False (F9): a ct note must NOT be claimed at render
+            # time — the render can run on a tick whose delivery is later dropped
+            # (stale epoch) and would silently swallow the note. The caller claims
+            # ct notes separately AFTER the delivery commits.
+            # settle=True: this free-round render clears kick reasons / stamps
+            # receipts — the line is about to be typed into the window.
+            data = note.gather(conn, cfg, now, window_sid=sid, consume_kick=True,
+                               claim_ct_notes=False, settle=True)
             text = note.render(cfg, now, data).strip()
-            # FIX 6 + P2-B: the deferred advance must use the SAME cutoff this
-            # note was built on, captured inside gather() — not a second query
-            # here, which could race in an event this note never rendered and
-            # then drop it when the baseline advances past it.
-            pending = data.get("replay_cutoff_ts")
+            # Mirror to disk so a human reading the file sees the same state.
+            # Best-effort: a mirror failure must not affect the tuck-in.
+            try:
+                from cortex import window
+                window.write_note(cfg, text, sid=sid)
+            except Exception:
+                pass
         finally:
             conn.close()
-        return text, pending
+        return text
     except Exception:
-        return "", None
+        return ""
 
 
-def _build_tuck_in_line(cfg: dict, mins: float) -> tuple[str, str | None]:
-    """Render the free-round line OUTSIDE any lock (BUG B: the slow note render +
-    template fill must not run inside the strict section). {mins} = real minutes
-    since the user's last message, {user} = marrow user_name. Every free-round
-    injection (silence-gate AND wait-expiry, D6) prepends a freshly rendered
-    (diff-mode) wakeup note ABOVE the 3-choice marker line — intel before choice
-    (acceptance), and the marker lands LAST so it is the final decision cue.
-    Returns (line, pending_baseline_ts): the caller advances the diff baseline to
-    pending_baseline_ts ONLY AFTER the line is committed + written (FIX 6). ("",
-    None) when disabled."""
+def _build_tuck_in_line(cfg: dict, mins: float) -> tuple[str, str]:
+    """Render the free-round round OUTSIDE any lock (BUG B: the slow note render
+    + template fill must not run inside the strict section). {mins} = real
+    minutes since the user's last message, {user} = marrow user_name.
+
+    Returns (line, note_text):
+      line      — the SHORT marker line, the only thing typed on screen.
+      note_text — the freshly rendered note, delivered INVISIBLY: staged to
+                  free_round_note_path and injected by the marrow hook on the
+                  marker turn (same pattern as the wake bell), so the note never
+                  shows in the window.
+    ("", "") when the marker template is empty (disabled)."""
     tmpl = str(cfg["wake"].get("tuck_in_text") or "").strip()
     if not tmpl:
-        return "", None
+        return "", ""
     line = tmpl.replace("{mins}", str(int(round(mins)))) \
                .replace("{user}", config.user_name(cfg))
-    fresh, pending = _free_round_note(cfg)
-    if fresh:
-        line = fresh + "\n" + line
-    return line, pending
+    return line, _free_round_note(cfg)
 
 
-def _advance_note_baseline(cfg: dict, pending_ts: str | None) -> None:
-    """Persist the diff-mode replay baseline (wake_state.last_note_ts) to
-    pending_ts, but ONLY after a free-round injection has actually committed +
-    been written (FIX 6). Monotonic: only moves forward. A failed inject never
-    reaches here, so the events it would have shown stay replayable next round.
-    Best-effort — never raises."""
-    if not pending_ts:
+def _stage_free_round_note(cfg: dict, text: str) -> None:
+    """Stage the invisible free-round payload for the marrow hook. APPENDS: a
+    marker turn the hook has not consumed yet must never be overwritten by the
+    next one (the ct-note delivery types a second marker right after the first),
+    else a whole note is lost. Best-effort — a staging failure only costs the
+    invisible body, the marker still lands."""
+    if not text:
         return
     try:
-        cur = wake_state.get_last_note_ts(cfg)
-        if not cur or str(pending_ts) > str(cur):
-            wake_state.set_last_note_ts(cfg, str(pending_ts))
-    except Exception:
-        pass
-
-
-def _write_tuck_in_line(cfg: dict, line: str) -> None:
-    """Append a prebuilt tuck-in line to wake_signal.log (the ear Monitor
-    delivers it as a session turn). Byte-identical output to the old path."""
-    if not line:
-        return
-    try:
-        p = config.wake_signal_log_path(cfg)
+        p = wake_state.free_round_note_path(cfg)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
-            f.write(line + "\n")
+        with p.open("a", encoding="utf-8") as f:
+            if p.stat().st_size:
+                f.write("\n\n")
+            f.write(text.strip())
     except OSError:
         pass
 
 
-def _wait_expired(cfg: dict) -> bool:
-    """True when a wait(N) window was declared and its deadline is now in the PAST
-    (exists but no longer live). Distinct from _wait_until_live: a future deadline
-    holds silence; a past one triggers the free-round injection."""
-    wu = wake_state.get_wait_until(cfg)
-    return wu is not None and datetime.now(timezone.utc) >= wu
+def _clear_free_round_note(cfg: dict) -> None:
+    """Drop a staged payload whose marker never landed — nothing typed means no
+    turn will ever consume it, and leaving it would double the next round."""
+    try:
+        wake_state.free_round_note_path(cfg).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
-def _clear_wait_and_stamp():
-    """Mutator (run under conditional_mutate): on a wait-expiry, atomically drop
-    silence_wait_until AND stamp tuck_pending so the 5-min grace auto-lie arms.
-    Stamps only when still awake + no tuck_pending yet. Returns True on a fresh
-    stamp (caller appends the free-round line), False otherwise. The epoch check
-    is conditional_mutate's token guard — a user message between expiry and poll
-    (stale token) drops this whole branch (wait already cleared by the reset)."""
-    def _m(d: dict) -> bool:
-        if not d.get("awake"):
-            return False
-        d.pop("silence_wait_until", None)  # clear regardless (fires once)
-        if d.get("tuck_pending") is not None:
-            return False
-        d["tuck_pending"] = datetime.now(timezone.utc).isoformat()
+def _deliver_free_round(cfg: dict, line: str, note_text: str) -> bool:
+    """Stage the invisible note, then type ONLY the short marker line. Returns
+    what the typing returned. A failed type un-stages the note (no turn will
+    consume it)."""
+    _stage_free_round_note(cfg, note_text)
+    ok = _type_tuck_in_line(cfg, line)
+    if not ok:
+        _clear_free_round_note(cfg)
+    return ok
+
+
+def _type_tuck_in_line(cfg: dict, line: str) -> bool:
+    """Type the short marker line into the resident window (one submitted turn).
+    Returns True when the line landed (or was empty), False when there is no
+    resident window / typing failed, so the atomic deliver+advance path skips the
+    baseline advance on a failed delivery (no lost events)."""
+    if not line:
         return True
-    return _m
+    try:
+        return bool(window.inject_prompt(cfg, line))
+    except window.WindowError:
+        return False
 
 
-def _stamp_tuck_pending():
-    """Mutator (run under conditional_mutate): stamp tuck_pending ONLY if the
-    session is still awake, has no live wait window, and no tuck_pending yet.
-    Returns True when it stamped (caller then appends the line), False otherwise
-    (nothing appended). The epoch check is done by conditional_mutate's token
-    guard; these are the in-lock content invariants."""
+def _deliver_ct_notes(cfg: dict, line: str) -> None:
+    """F9: after a free-round line has committed + landed, claim any pending ct
+    notes and surface them in their own round — staged INVISIBLY (same file the
+    marrow hook consumes on a marker turn) with only the short marker line typed.
+    Stamps claimed_by='cortex.free_round'. Done OUTSIDE the render (which passed
+    claim_ct_notes=False) so an off-screen tick whose delivery was dropped never
+    claims a note. Best-effort: never raises."""
+    try:
+        from cortex import db, note
+        conn = db.connect(cfg)
+        try:
+            text = note.claim_ct_notes_text(cfg, conn, "cortex.free_round")
+        finally:
+            conn.close()
+        if text:
+            _deliver_free_round(cfg, line, text)
+    except Exception:
+        pass
+
+
+def _stamp_free_round():
+    """Mutator (run under conditional_mutate): stamp tuck_pending = now as the
+    "last free-round injection" marker, unconditionally (used by both the
+    silence-cycle and the kick-carrier fires — each successful injection re-arms
+    from this instant, closed loop). Awake-only; a session that already slept
+    under us must not be stamped. Returns True on stamp."""
     def _m(d: dict) -> bool:
         if not d.get("awake"):
             return False
-        if d.get("tuck_pending") is not None:
-            return False
-        raw = d.get("silence_wait_until")
-        if raw is not None:
-            try:
-                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                if dt > datetime.now(timezone.utc):
-                    return False  # live wait -> hold, no tuck-in
-            except ValueError:
-                pass
         d["tuck_pending"] = datetime.now(timezone.utc).isoformat()
         return True
     return _m
 
 
 def silence_action(cfg: dict, silent_min: float, *, allow_tuck: bool = True) -> str | None:
-    """Two-tier silence decision, shared by the watchdog and the tick awake gate.
-
-    Chat tier (user replied this wake): at silent_max_min, with no live
-    wait_until, append the TUCK-IN marker once (tuck_pending stamped so it isn't
-    re-appended); after tuck_grace_min more with no wait/lie_down -> proxy
-    lie_down(auto).
-    No-user tier (no reply this wake): at no_user_gate_min, no live wait_until
-    -> proxy lie_down(auto) immediately, no marker.
-    A live wait_until holds everything. Returns an action label for logging, or
-    None (keep waiting / handled without sleeping)."""
-    from cortex import lie_down as lie_down_mod
-
+    """Perpetual free-round cycle, shared by the watchdog and the tick awake
+    gate: every silent_max_min of user silence, inject one free-round note +
+    marker line and re-arm the SAME timer from that instant — repeat forever,
+    no forced sleep. tuck_pending doubles as the "last injection at"
+    marker (renamed at the API surface only; the persisted field stays
+    tuck_pending, T5 territory). When the user never spoke this wake,
+    `silent_min` is timed from awake_since instead so the gate still elapses.
+    An external kick carrier (kick.py mark_kick_round) short-circuits the
+    silent_min gate and fires the injection immediately, then re-arms the same
+    cycle. Returns an action label for logging, or None (keep waiting)."""
     wcfg = cfg["wake"].get("watchdog", {})
     # Capture the epoch at the START of the silence decision (BUG B): if a
-    # lie_down / user reset bumps gen between here and the tuck-in commit, the
-    # commit is dropped so no tuck-in is appended after the session already slept.
+    # lie_down / user reset bumps gen between here and the commit, the commit is
+    # dropped so no line is appended after the session already slept.
     try:
         gen0, sid0 = wake_state.current_epoch(cfg)
         token0 = (gen0, sid0)
     except wake_state.StateValidationError:
         return None
-    if _wait_until_live(cfg):
-        return None
 
-    # Wait-expiry free-round (D1): a wait(N) window that has now elapsed injects
-    # the free-round line IMMEDIATELY, bypassing the silent_min gate. Epoch-guarded
-    # (BUG A): a user message between expiry and this poll bumps gen -> the token
-    # is stale -> conditional_mutate raises and nothing is injected (the reset
-    # already cleared the wait). On a fresh epoch: clear the wait + stamp
-    # tuck_pending (grace arms) + append the free-round line.
-    if _wait_expired(cfg):
-        line, pending_ts = ("", None)
+    # Kick carrier (replaces the retired wait-expiry ride): an external kick
+    # stamped kick_round=True to force this round's injection NOW, regardless of
+    # silent_min. Consume it (read-and-clear) before deciding anything else so a
+    # kick always gets exactly one carrier fire.
+    if wake_state.peek_kick_round(cfg):
+        line, note_text = ("", "")
         if allow_tuck:
-            line, pending_ts = _build_tuck_in_line(cfg, silent_min)
+            line, note_text = _build_tuck_in_line(cfg, silent_min)
         try:
             committed = wake_state.conditional_mutate(
-                cfg, token0, _clear_wait_and_stamp())
+                cfg, token0, _stamp_free_round())
         except wake_state.StateValidationError:
             return None  # stale epoch (user returned) / lock lost -> inject nothing
         if not committed:
-            return None  # not awake / already stamped -> no double injection
+            return None  # not awake -> no injection
+        wake_state.take_kick_round(cfg)  # consume: exactly one carrier fire
         if allow_tuck:
-            _write_tuck_in_line(cfg, line)
-            _advance_note_baseline(cfg, pending_ts)  # FIX 6: only after commit+write
-        return "wait-expiry free-round appended"
+            _deliver_free_round(cfg, line, note_text)
+            _deliver_ct_notes(cfg, line)  # F9: claim ct notes now the round surfaces
+        return "kick free-round appended"
 
-    if not wake_state.user_replied_this_wake(cfg):
-        # Accident safety net only (not a daily-flow step): fires when the user
-        # never spoke this wake. Time it from awake_since (elapsed since wake) —
-        # NOT from silent_min, which is derived from a user-message ts that on a
-        # never-spoken wake is None -> 0.0 and would never elapse. Semantics
-        # unchanged otherwise: proxy auto lie_down (arms next alarm via dice), no
-        # marker.
-        gate = float(wcfg.get("no_user_gate_min", 5))
-        elapsed = wake_state.awake_since_min(cfg)
-        if elapsed is None:
-            elapsed = silent_min  # no awake_since -> fall back to prior behaviour
-        if elapsed >= gate:
-            lie_down_mod.lie_down(cfg, force_slept="auto")
-            return "no-user gate -> auto sleep"
-        return None
+    # Single silence basis (wake_state.silence_basis_min): the newest of the
+    # transcript read and the hook-stamped last_user_msg_ts, falling back to
+    # awake_since when the user never spoke this wake. The transcript alone lags
+    # the hook, which has already dropped tuck_pending -> instant re-fire on the
+    # user's own message.
+    st = wake_state.load(cfg)
+    if st.get("next_wake_at"):
+        return None  # mutual exclusion: an armed alarm owns the deadline, the
+        #              idle cycle does not tick underneath it
+    silent_min = wake_state.silence_basis_min(cfg, silent_min)
 
-    # Chat tier.
-    silent_max = float(wcfg.get("silent_max_min", 15))
-    grace = float(wcfg.get("tuck_grace_min", 5))
+    silent_max = float(wcfg.get("silent_max_min", 20))
     if silent_min < silent_max:
         return None
-    st = wake_state.load(cfg)
-    tuck_at = st.get("tuck_pending")
-    if tuck_at is None:
-        # Build the (slow) tuck-in text OUTSIDE the lock, then commit atomically:
-        # re-check awake + epoch + no-live-wait + tuck_pending-still-absent under
-        # the strict lock and stamp tuck_pending in the same section (fixes the
-        # TOCTOU at the old :214-219). Only a committed stamp appends the line.
-        line, pending_ts = ("", None)
-        if allow_tuck:
-            line, pending_ts = _build_tuck_in_line(cfg, silent_min)
+    last_at = st.get("tuck_pending")
+    if last_at is not None:
+        # Already injected once this wake -> only re-fire once ANOTHER full
+        # silent_max_min has elapsed since that injection (perpetual cycle, not
+        # a re-fire on every poll past the threshold).
         try:
-            committed = wake_state.conditional_mutate(
-                cfg, token0, _stamp_tuck_pending())
-        except wake_state.StateValidationError:
-            return None  # slept / re-armed under us -> no tuck-in
-        if not committed:
-            return None  # awake cleared / wait live / already stamped
-        if allow_tuck:
-            _write_tuck_in_line(cfg, line)
-            _advance_note_baseline(cfg, pending_ts)  # FIX 6: only after commit+write
-        return "tuck-in appended"
-    # Marker already sent; wait out the grace window (measured from the marker).
+            marked = datetime.fromisoformat(str(last_at).replace("Z", "+00:00"))
+            if marked.tzinfo is None:
+                marked = marked.replace(tzinfo=timezone.utc)
+            since_last = (datetime.now(timezone.utc) - marked).total_seconds() / 60.0
+        except ValueError:
+            since_last = silent_max  # unparseable marker -> treat as due
+        if since_last < silent_max:
+            return None
+
+    # Build the (slow) tuck-in text OUTSIDE the lock, then commit atomically:
+    # re-check awake + epoch under the strict lock and stamp the injection
+    # marker in the same section (TOCTOU-safe). Only a committed stamp appends
+    # the line.
+    line, note_text = ("", "")
+    if allow_tuck:
+        line, note_text = _build_tuck_in_line(cfg, silent_min)
     try:
-        marked = datetime.fromisoformat(str(tuck_at).replace("Z", "+00:00"))
-        if marked.tzinfo is None:
-            marked = marked.replace(tzinfo=timezone.utc)
-    except ValueError:
-        marked = None
-    grace_over = marked is None or (
-        datetime.now(timezone.utc) - marked).total_seconds() / 60.0 >= grace
-    if grace_over:
-        lie_down_mod.lie_down(cfg, force_slept="auto")
-        return "tuck grace elapsed -> auto sleep"
-    return None
+        committed = wake_state.conditional_mutate(
+            cfg, token0, _stamp_free_round())
+    except wake_state.StateValidationError:
+        return None  # slept / re-armed under us -> no injection
+    if not committed:
+        return None  # awake cleared under us -> no injection
+    if allow_tuck:
+        _deliver_free_round(cfg, line, note_text)
+        _deliver_ct_notes(cfg, line)  # F9: claim ct notes now the round surfaces
+    return "free-round appended"
 
 
 def _log(msg: str) -> None:
@@ -492,7 +530,7 @@ def _log(msg: str) -> None:
 def run(cfg: dict) -> int:
     wcfg = cfg["wake"].get("watchdog", {})
     poll = int(wcfg.get("poll_sec", 60))
-    fuse = int(wcfg.get("fuse_tokens", 150_000))
+    fuse = int(wcfg.get("fuse_tokens", 180_000))
     grace = float(wcfg.get("hard_interrupt_grace_sec", 30))
 
     _log(f"watchdog start pid={os.getpid()} poll={poll}s fuse={fuse}")
@@ -502,11 +540,22 @@ def run(cfg: dict) -> int:
         if not st.get("awake"):
             _log("awake cleared -> watchdog retires")
             return 0  # cortex lay down on its own -> watchdog retires
-        if wake_state.is_paused(cfg):
-            continue  # DND: no reaps / tuck-ins / fuse while paused
+        # Window liveness gate: an accidentally-closed window leaves the ledger
+        # awake, so silence_action / _fuse below would forge a proxy lie_down
+        # (writing a future next_wake_at floor that starves the reconcile rescue
+        # branch). A dead window must never receive a proxy sleep from here —
+        # retire and let daemon reconcile (dead+awake+no-alarm -> resume) own
+        # the revival.
+        from cortex import wake
+        if not wake._window_alive(cfg):
+            _log("window dead -> no proxy sleep, watchdog retires; "
+                 "reconcile owns revival")
+            return 0
+        if breaker.holds(cfg, "cli"):
+            continue  # breaker: no reaps / tuck-ins / fuse while held
 
         # Silence source = minutes since the last REAL user message (assistant
-        # turns / system writes / ear injections do NOT reset it). None (no user
+        # turns / system writes / machine injections do NOT reset it). None (no user
         # message found in tail) -> 0.0 = hold, same as an unreadable transcript.
         silent_min = transcript.user_silent_min(cfg) or 0.0
         tokens = transcript.window_tokens(cfg)
@@ -515,7 +564,7 @@ def run(cfg: dict) -> int:
         # wake's Budget line; reuse `tokens` computed above (also drives fuse).
         conn = db.connect(cfg)
         try:
-            integration.store_window_tokens(conn, tokens)
+            occupancy.store_window_tokens(conn, tokens)
         finally:
             conn.close()
 
@@ -523,8 +572,8 @@ def run(cfg: dict) -> int:
             _log(f"fuse: tokens={tokens} >= {fuse}")
             _fuse(cfg, grace)
             return 0
-        # Two-tier silence: chat (tuck-in then grace) / no-user (short gate).
-        # A proxy sleep here is force_slept="auto" (routine, not an incident).
+        # Idle gate (free-round cycle), same bar regardless of user presence.
+        # silence_action only injects a free-round note here — no proxy sleep.
         action = silence_action(cfg, silent_min)
         if action:
             _log(f"silence_action: {action} (silent={silent_min:.0f}min)")
@@ -534,6 +583,9 @@ def run(cfg: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     cfg = config.load()
+    if not config.shell_enabled(cfg):
+        _log("cli shell off (marrow [cortex].shells): watchdog not started")
+        return 0
     pidfile = wake_state.watchdog_pidfile_path(cfg)
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     pidfile.write_text(str(os.getpid()))

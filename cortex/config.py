@@ -6,32 +6,38 @@ on a missing config file.
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import tomllib
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "marrow" / "cortex.toml"
 DEFAULT_MARROW_DB = Path.home() / ".config" / "marrow" / "marrow.db"
 DEFAULT_KNOWLEDGEC_DB = (
     Path.home() / "Library" / "Application Support" / "Knowledge" / "knowledgeC.db"
 )
-DEFAULT_AFFECT_FLAG = Path.home() / ".config" / "marrow" / "cortex" / "affect_flag.json"
-DEFAULT_SELF_SCHEDULE = Path.home() / ".config" / "marrow" / "cortex" / "self_schedule.json"
-DEFAULT_HANDOFF = Path.home() / ".config" / "marrow" / "cortex" / "handoff.md"
+# Per-shell rolling log; this repo is the cli shell (mirror of marrow
+# [cortex].handoff_file_pattern = "handoff-{shell}.md"). Override: paths.handoff_file.
+DEFAULT_HANDOFF = Path.home() / ".config" / "marrow" / "cortex" / "handoff-cli.md"
 DEFAULT_CORTEX_HOME = Path.home() / ".config" / "marrow" / "cortex"
 DEFAULT_NY_DB_PAGES = Path.home() / "Desktop" / "NY" / "db-pages"
 DEFAULT_MARROW_REPO = Path.home() / "CC-Lab" / "marrow"
 DEFAULT_WAKE_TIMING_LOG = Path.home() / ".config" / "marrow" / "logs" / "wake_timing.log"
 
-# Single source of truth for the machine-line marker family (wake bell / free-
-# round / night / fuse / ctl / slash-command). Referenced by _DEFAULTS below AND
+# Single source of truth for the machine-line marker family (wake bell /
+# free-round / fuse / ctl / slash-command). Referenced by _DEFAULTS below AND
 # by transcript._line_markers' fallback so the two can never drift.
-DEFAULT_MACHINE_LINE_MARKERS = ["[TUCK-IN]", "[NEW ROUND]", "[NIGHT]",
-                                "[FUSE]", "[CTL]", "[CMD"]
+DEFAULT_MACHINE_LINE_MARKERS = ["[NEW ROUND]", "[FUSE]", "[CTL]", "[CMD"]
 
 _DEFAULTS: dict[str, Any] = {
-    "core": {"timezone": "Australia/Melbourne"},
+    # Empty = follow the OS timezone; set an IANA name only for headless/VPS
+    # deploys where the OS tz differs from the user's.
+    "core": {"timezone": ""},
     "paths": {
         "marrow_db": "",
         "knowledgec_db": "",
@@ -45,11 +51,12 @@ _DEFAULTS: dict[str, Any] = {
         "ny_db_pages": "",
         "wake_timing_log": "",
         "wake_audit_log": "",
+        # Non-cli shell ledgers (<dir>/<shell>.json, written by each shell's
+        # host). Mirror of marrow [cortex].shell_state_dir. Empty =
+        # <marrow config dir>/state/shells.
+        "shell_state_dir": "",
     },
-    # Per-wake safety valve: cap tokens spent in one wake; breach or the marrow
-    # wall-clock timeout (marrow.call_timeout_s) forces a fresh session next wake.
-    # signal_log = the ear's tail-followed wake signal file (alive-resident wake);
-    # ear_timeout_sec = how long the pacemaker waits for an alive-window wake to
+    # ear_timeout_sec = how long a typed wake (alive-resident bell) is given to
     # land before respawning fresh; wake_prompt = the first prompt baked into a
     # freshly spawned window — JUST an emoji so nothing readable shows in the
     # user's face; the full wake instructions are injected by marrow's
@@ -57,64 +64,63 @@ _DEFAULTS: dict[str, Any] = {
     # window (the note path itself is read from config, not this prompt);
     # say_sound = the sound say() plays when it fronts the window.
     "wake": {
-        "token_cap": 150_000,
-        "signal_log": "",
+        # Auto-adopt a cortex window the user opened `claude` in herself (in
+        # cortex_home) but never registered: the daemon reconcile records it as
+        # the resident (under the spawn lock) instead of firing a duplicate window.
+        "auto_adopt": True,
         "ear_timeout_sec": 90,
         "wake_prompt": "☀️",
-        # Bell marker line the marrow UserPromptSubmit hook detects to inject the
-        # full wakeup note. Signal is a BELL ONLY — no note body, no read errand.
-        # Rendered as "<marker> HH:MM" (local time). rearm_suffix is appended when
-        # the ear died and the pacemaker re-types the marker into an alive window.
-        "wake_signal_marker": "[CORTEX-WAKE]",
-        "rearm_suffix": " (ear died — rearm)",
+        # Visible wake lines = human text ONLY (no machine marker, no epoch
+        # token). The machine data (template/gen/state_id/rearm) is written to
+        # the wake_state receipt sidecar instead (window.write_wake_receipt);
+        # the marrow hook matches the on-screen line against that receipt.
+        # {hm} = local HH:MM. The static PREFIX (text before {hm}) is persisted
+        # into wake_state so the consumer can shape-match without cortex config.
+        #   spawn_opener_template — baked as the FIRST prompt of a freshly
+        #     spawned window (fresh_initial_prompt); also the window-lineage
+        #     marker (transcript.lineage_marker).
+        #   wake_bell_template — TYPED into an already-running resident window
+        #     (scheduled wake on a live window, resume bell).
+        "spawn_opener_template": "☀️ {hm}",
+        "wake_bell_template": "⏰ {hm}",
+        # Receipt time-to-live (minutes): the consumer ignores a pending receipt
+        # older than this, and the producer overwrites it on every new bell.
+        "receipt_ttl_min": 15,
         "say_sound": "Glass",
-        # Max wait() calls allowed per wake (reset on wake start / lie_down).
-        # 0 = uncapped (permanent residency; night gate / 150k fuse / grace
-        # auto-lie / user return are the backstops).
-        "wait_max_per_wake": 0,
-        # wait() clamp bounds (minutes). Own bounds, decoupled from the floor
-        # draw window (triggers.floor_*): wait guards the hot cache TTL. Floor 16 >
-        # silence gate (15) keeps wait strictly "post-gate renewal".
-        "wait_min": 16,
-        "wait_max": 55,
-        # lie_down(next_wake_min=N) clamp (minutes): [next_wake_min, next_wake_max]
-        # normally; a rotate short-sleep lowers the floor to next_wake_rotate_min.
-        "next_wake_min": 90,
-        "next_wake_rotate_min": 16,
+        # lie_down(next_wake_min=N) clamp (minutes): [0, next_wake_max], every
+        # hour (0 = immediate re-wake).
         "next_wake_max": 360,
-        # Exact-time wake: arm cortex.sentinel (one-shot detached sleep-then-tick)
-        # at every lie_down. false = tick-only (launchd 5-min fallback).
-        "sentinel": True,
-        # Free-round marker appended to wake_signal.log at the silence gate or a
-        # wait(N)-expiry. {mins} = real minutes since the user's last message;
-        # {user} = marrow user_name (fallback "the user").
-        "tuck_in_text":
-            "⏳ [NEW ROUND] {mins} min since {user}'s last message. Choose again: "
-            "1) play around (playbook); 2) wait(N) (16-55min); "
-            "3) lie_down(next_wake_min=N) (90-360min). Feel free to do anything. "
-            "No need to wait for reply - {user} will wake you the moment she's back.",
-        # Markers that identify a NON-user turn (wake bell / free-round / night /
-        # fuse / ctl / slash-command line), so they never reset the silence timer
-        # and downstream memory drops them. wake_signal_marker is added
-        # automatically. Substring match, so "[CMD" catches every ⚙️ [CMD ct-*].
+        # Typed into the window at every free-round injection (silence
+        # cycle or kick carrier): the free-round note above it, this line last as
+        # the final cue. MUST contain the tuck_in_marker family string
+        # ("[NEW ROUND]") — that machine-line detection is what keeps the line
+        # from resetting the silence timer; without it every injection would
+        # re-arm its own cycle (perpetual loop trap). {mins}/{user} optional
+        # placeholders; {user} = marrow user_name.
+        "tuck_in_text": "⏳ [NEW ROUND] Time for a new turn — try something else "
+                         "you fancy, go talk to {user} if you miss her, or "
+                         "lie_down for a rest.",
+        # Markers that identify a NON-user turn (wake bell / free-round / fuse /
+        # ctl / slash-command line), so they never reset the silence timer
+        # and downstream memory drops them. The bell prefix (lineage_marker) is
+        # added automatically. Substring match, so "[CMD" catches every ⚙️ [CMD ct-*].
         "machine_line_markers": list(DEFAULT_MACHINE_LINE_MARKERS),
-        # When a declared wait(N) expires, append a freshly rendered wakeup note
-        # to the free-round marker (note content only, no behavioural nudge).
-        "wait_expiry_note": True,
-        # Manual `cortex.ctl sleep` instruction injected into a live window.
-        # {mins} = next_wake_min; {rotate} = "write your handoff then " when
-        # --rotate, else ""; {rotate_arg} = ", rotate=true" when --rotate, else "".
-        "ctl_sleep_prompt":
-            "⚙️ [CTL] Wrap up this turn: "
-            "{rotate}lie_down(next_wake_min={mins}{rotate_arg}).",
+        # Every free-round injection (silence cycle or kick carrier) appends a
+        # freshly rendered wakeup note above the marker line (note content only,
+        # no behavioural nudge).
+        "free_round_note": True,
+        # Covert-delivery markers typed directly into the window (Monitor
+        # retired, T11 P3). Only the marker line reaches the window; the full
+        # instruction body is injected invisibly by the
+        # marrow hook keyed on the marker (fuse -> [cortex].fuse_prompt_text;
+        # ctl -> [cortex].ctl_sleep_text, rendered from the mins/rotate args the
+        # ctl marker line carries).
+        "fuse_marker": "⚙️ [FUSE]",
+        "ctl_sleep_marker": "⚙️ [CTL]",
     },
-    # marrow repo invocation for the wake call (separate venv/deps, C3).
+    # marrow repo invocation for subprocess helpers (separate venv/deps, C3).
     "marrow": {
-        "repo_dir": str(DEFAULT_MARROW_REPO),
         "venv_python": str(DEFAULT_MARROW_REPO / ".venv" / "bin" / "python"),
-        # Inner claude-call budget (s), passed down to marrow; the outer
-        # subprocess kill = this + margin. Must match marrow's own default.
-        "call_timeout_s": 600,
     },
     "knowledgec": {"stream_name": "/app/usage"},
     "knowledgec.categories": {"default": "uncategorized"},
@@ -123,86 +129,126 @@ _DEFAULTS: dict[str, Any] = {
     # launchd tick cadence (seconds). Baked into plists at install time.
     "tick": {
         "collect_interval_sec": 1800,
-        "pacemaker_interval_sec": 300,
         # OAuth usage % snapshot (marrow subprocess) each collect tick.
         "usage_snapshot": True,
     },
-    # Pacemaker integration knobs (numbers the integration layer computes with).
+    # Reconcile knob: gates whether a fired ledger wake actually spawns
+    # (reconcile.py _fire_dead_window) or just redraws the floor, log-only.
     "pacemaker": {
         "dry_run": True,
-        "active_window_min": 5,
-        "at_home_default": True,
-        "cal_busy_default": False,
-    },
-    "gates": {
-        # Night window (plan 07-08): zero self-wakes 23-06 — floor/
-        # self_scheduled/affect_flag all silent.
-        # close_prompt = wrap-up instruction injected once into a still-awake
-        # resident window when the night window opens (write handoff + lie_down).
-        "night": {
-            "start": "23:00", "end": "06:00", "cap": 0,
-            "close_prompt": "⏳ [NIGHT] Night window is open — one full sleep now. "
-                            "Write your handoff entry, then lie_down to end this wake.",
-        },
-        # Daily wake-token budget: once Cortex Today (sum of today's finished-
-        # window final context occupancies + the current live window occupancy)
-        # reaches this, self-wakes stop; resets at local midnight.
-        "daily_budget": {"tokens": 1_000_000},
     },
     "triggers": {
-        # Wake-window draw (minutes) from lie-down. lie_down picks the next wake:
-        # an explicit choice clamped to [min, max] (max = cache-TTL guard, min =
-        # anti-thrash), or a uniform "dice" draw within the window when omitted.
-        # Also the clamp for a model-declared watchdog silence window.
-        "floor_min_min": 10,
-        "floor_max_min": 55,
+        # Wake-window interval (minutes) from lie-down. lie_down picks the
+        # next wake: an explicit choice, or this fixed interval when omitted.
+        "floor_min": 55,
+    },
+    # External-wake (cortex.kick) reason lines rendered as plain lines into the
+    # wakeup note (no section header), then cleared on delivery. A bridge/cli
+    # poke appends one; note.py renders + consumes it. {id} = outbox note id;
+    # {text} = her reply body (truncated by the bridge); {minutes} = silence min.
+    "kick": {
+        "reason_reply": 'Msg #{id} replied: "{text}"',
+        "reason_timeout": "Msg #{id} no reply in {minutes}min",
+        "reason_morning": "She's up — day mode",
+        "reason_note": "New note #{id}",
+        # Cap the pending-flag list so a stuck bridge can't grow it unbounded.
+        "max_reasons": 8,
     },
     # Wakeup note knobs. Every field is deterministic now, so the old whole-note
     # max_chars cap is gone; per-source limits below keep each line bounded.
     # OSS: identity/display strings stay in config, never hardcoded in .py.
     "note": {
+        # Machine-origin tag prepended as the VERY FIRST line of every wakeup
+        # note (before title), so the model treats the ☀️ bell/wake-prompt turn
+        # that carried this note as an automated scheduler signal, NOT a message
+        # the user personally typed. Note-copy only -- does NOT change the bell
+        # text or receipt matching. "" omits it.
+        "wake_machine_tag":
+            "[AUTOMATED WAKE SIGNAL — Note delivered by the scheduler]",
         # Optional first line of the wakeup note (e.g. a nickname for the
         # note), followed by a blank line then the usual content. "" omits it.
         "title": "",
-        # Trailing conversation events force-appended to the Replay block
-        # (cross-session, uniform, no decay). 4 = two round-trips.
-        "replay_events": 4,
-        # Per-event truncation inside the Replay block.
-        "replay_event_chars": 300,
-        # Daily wake-token (NET spend) budget the "Cortex Today X/Y" segment
-        # renders against — must match gates.daily_budget.tokens (display=gate).
-        "daily_budget": 1_000_000,
         # Pending self-schedule entries surface only when due within this window.
         "pending_window_min": 15,
-        # Prior window force-slept without a handoff -> backfill hint line.
-        "force_slept_catchup_text":
-            "Prior window was force-slept — catchup by recall all events from DB "
-            "(do not read raw jsonl) and append to handoff.md",
-        # Prior window DIED (crash/manual close) mid-wake without writing its
-        # handoff -> the fresh respawn recovers context from its transcript.
-        "died_no_handoff_catchup_text":
-            "Previous window died without a handoff — recover context from its "
-            "transcript, then write the handoff.",
+        # Reply-receipt line (C11): one per sent note she has replied to since the
+        # last note. {id}/{channel}/{sent_hm}/{replied_hm}/{text} render from the
+        # marrow outbox row at note time. "" omits receipts entirely.
+        "receipt_line": 'Note #{id} ({channel} {sent_hm}): she replied {replied_hm} "{text}"',
         # One-line turn-end reminder appended at the very end of every rendered
-        # note. "" omits it.
-        "turn_end_text":
-            "NOTE: Call MCP tool to wait or lie_down at the end of each turn. "
-            "Wait=wait(N) [N=16-55]; sleep=lie_down(next_wake_min=N) "
-            "[90-360; rotate=True unlocks ≥16]. "
-            "Skip call = sleep in 5 mins. Auto timer is on during active chat "
-            "- no call needed.",
+        # note. "" omits it (default: the silence cycle + free-round injection
+        # already carries this information, no reminder needed).
+        "turn_end_text": "",
         # Header written into a freshly-created wishlist.md (append-only file,
         # never overwritten). Display text — customise freely.
         "wishlist_header":
             "# Wishlist\n\n(owed treats / wants / self-rewards — append-only)\n",
     },
+    # Cross-channel note delivery into the cortex window. Header for a ct-targeted
+    # outbox note rendered by the wakeup note (mirror of marrow [outbox].inject_header
+    # — must stay in sync so hook-delivered and note-delivered notes read the same).
+    # {channel}/{sid4}/{time} render from the outbox row. "" = body only.
+    "outbox": {
+        "inject_header": "📮 Message from {channel}·{sid4} {time}",
+    },
+    # cortex.daemon: the always-on cli timing loop (scheduler-hosted). Owns the
+    # reconcile cadence and the business deadline (next_wake_at / silence round).
+    "daemon": {
+        "enabled": True,
+        # Scheduler shell key. The reconcile deadline uses "<shell>.reconcile";
+        # lie_down's socket kick sends "<shell>" (the business key).
+        "shell": "cli",
+        # Kick socket. "" -> <state_dir>/cortex-daemon.sock. Keep the resolved
+        # path under 104 bytes (AF_UNIX limit) — checked at resolve time.
+        "socket_path": "",
+        "kick_timeout_sec": 1.0,
+        # Reconcile cadence (also the scheduler's max sleep).
+        "reconcile_interval_sec": 60,
+        # Re-arm gap for the business key when nothing is pending.
+        "safety_horizon_sec": 300,
+        # Re-arm gap after a held/failed business fire (anti-spin).
+        "retry_interval_sec": 60,
+        # Singleton lock. "" -> <state_dir>/daemon.lock.
+        "lock_path": "",
+    },
 }
 
 _SECTIONS = (
     "core", "paths", "knowledgec", "geofence", "health",
-    "tick", "pacemaker", "gates", "triggers", "marrow",
-    "wake", "note",
+    "tick", "pacemaker", "triggers", "marrow",
+    "wake", "note", "kick", "outbox", "daemon",
 )
+
+
+def shell_enabled(cfg: dict, shell: str = "cli") -> bool:
+    """Is `shell` listed in marrow's [cortex].shells (T6: single source, no
+    cortex.toml copy)? Missing/unreadable marrow config or missing key falls
+    back to ["cli"] — the cli heartbeat entries exit early when their own
+    shell is switched off there."""
+    raw = ["cli"]
+    p = marrow_config_dir(cfg) / "config.toml"
+    try:
+        if p.is_file():
+            with p.open("rb") as f:
+                data = tomllib.load(f)
+            shells = (data.get("cortex") or {}).get("shells")
+            if isinstance(shells, list):
+                raw = shells
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("shell_enabled: marrow config read failed (%s) — using default ['cli']", e)
+    return shell.strip().lower() in [str(s).strip().lower() for s in raw]
+
+
+def wake_clamps(cfg: dict) -> dict[str, int]:
+    """The wake-clamp numbers rendered into note/tool text (never hardcoded).
+    lie_down bounds [0, next_wake_max] from [wake]; idle bar from
+    [wake.watchdog].silent_max_min."""
+    w = cfg.get("wake", {})
+    wd = w.get("watchdog", {})
+    return {
+        "next_wake_min": 0,
+        "next_wake_max": int(w.get("next_wake_max", 360)),
+        "silent_max_min": int(wd.get("silent_max_min", 20)),
+    }
 
 
 def _config_path() -> Path:
@@ -238,6 +284,13 @@ def load(path: Path | None = None) -> dict[str, Any]:
     if "bulletin" in loaded:
         cfg["note"] = _merge(cfg["note"], loaded["bulletin"])
 
+    # T6: [core].shells moved to marrow's [cortex].shells (single source) —
+    # a leftover key here is ignored, never fatal, just noted once.
+    if "shells" in loaded.get("core", {}):
+        logger.warning(
+            "cortex.toml [core].shells is ignored — shells are now driven by "
+            "marrow's [cortex].shells only")
+
     categories = dict(_DEFAULTS["knowledgec.categories"])
     loaded_categories = loaded.get("knowledgec", {}).get("categories", {})
     categories.update(loaded_categories)
@@ -246,9 +299,34 @@ def load(path: Path | None = None) -> dict[str, Any]:
     return cfg
 
 
+def os_tz() -> tzinfo:
+    """OS local timezone. Resolves the IANA zone via /etc/localtime so DST
+    transitions stay correct; falls back to the current fixed offset."""
+    try:
+        parts = Path("/etc/localtime").resolve().parts
+        if "zoneinfo" in parts:
+            return ZoneInfo("/".join(parts[parts.index("zoneinfo") + 1:]))
+    except Exception:
+        pass
+    return datetime.now().astimezone().tzinfo
+
+
+def get_tz(cfg: dict) -> tzinfo:
+    """[core] timezone if set, else the OS local timezone."""
+    name = (cfg.get("core", {}).get("timezone") or "").strip()
+    return ZoneInfo(name) if name else os_tz()
+
+
 def marrow_db_path(cfg: dict) -> Path:
     raw = cfg["paths"].get("marrow_db") or ""
     return Path(raw).expanduser() if raw else DEFAULT_MARROW_DB
+
+
+def marrow_config_dir(cfg: dict) -> Path:
+    """The shared marrow config/state dir (parent of marrow.db). Home of
+    config.toml, breaker.json and fuse_events.json — the cross-repo protocol
+    files cortex, marrow and the synapse bridges all read."""
+    return marrow_db_path(cfg).parent
 
 
 def user_name(cfg: dict, default: str = "the user") -> str:
@@ -261,7 +339,9 @@ def user_name(cfg: dict, default: str = "the user") -> str:
         if marrow_cfg.exists():
             with marrow_cfg.open("rb") as f:
                 data = tomllib.load(f)
-            name = str(data.get("user_name") or "").strip()
+            name = str(data.get("persona", {}).get("user_name") or "").strip()
+            if not name:
+                name = str(data.get("user_name") or "").strip()  # legacy top-level layout
             if name:
                 return name
     except (OSError, ValueError):
@@ -286,12 +366,12 @@ def health_export_path(cfg: dict) -> Path | None:
 
 def affect_flag_path(cfg: dict) -> Path:
     raw = cfg["paths"].get("affect_flag_file") or ""
-    return Path(raw).expanduser() if raw else DEFAULT_AFFECT_FLAG
+    return Path(raw).expanduser() if raw else state_dir(cfg) / "affect_flag.json"
 
 
 def self_schedule_path(cfg: dict) -> Path:
     raw = cfg["paths"].get("self_schedule_file") or ""
-    return Path(raw).expanduser() if raw else DEFAULT_SELF_SCHEDULE
+    return Path(raw).expanduser() if raw else state_dir(cfg) / "self_schedule.json"
 
 
 def handoff_path(cfg: dict) -> Path:
@@ -299,10 +379,42 @@ def handoff_path(cfg: dict) -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_HANDOFF
 
 
+def shell_state_dir(cfg: dict) -> Path:
+    """Directory holding the non-cli shell ledgers (<shell>.json). Mirror of
+    marrow's [cortex].shell_state_dir; empty = <marrow config dir>/state/shells."""
+    raw = cfg["paths"].get("shell_state_dir") or ""
+    if raw:
+        return Path(raw).expanduser()
+    return marrow_db_path(cfg).parent / "state" / "shells"
+
+
 def cortex_home(cfg: dict) -> Path:
     """cwd for the resumed full-env marrow cortex session (Decided 07-03 pm)."""
     raw = cfg["paths"].get("cortex_home") or ""
     return Path(raw).expanduser() if raw else DEFAULT_CORTEX_HOME
+
+
+def state_dir(cfg: dict) -> Path:
+    """Runtime state subdirectory (json/log/lock/pid files). Lives under
+    cortex_home/state/ to keep runtime artefacts out of the notebook root."""
+    d = cortex_home(cfg) / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+_SOCKET_PATH_MAX = 104  # macOS sun_path (AF_UNIX) capacity, including the NUL
+
+
+def daemon_socket_path(cfg: dict) -> Path:
+    """The wake daemon's kick socket. [daemon].socket_path, or
+    <state_dir>/cortex-daemon.sock when unset. Raises ValueError when the
+    resolved path cannot fit an AF_UNIX address (a bind would fail at runtime)."""
+    raw = str((cfg.get("daemon") or {}).get("socket_path") or "").strip()
+    p = Path(raw).expanduser() if raw else state_dir(cfg) / "cortex-daemon.sock"
+    if len(str(p).encode("utf-8")) >= _SOCKET_PATH_MAX:
+        raise ValueError(
+            f"[daemon].socket_path too long for AF_UNIX ({_SOCKET_PATH_MAX} bytes): {p}")
+    return p
 
 
 def wishlist_path(cfg: dict) -> Path:
@@ -329,17 +441,9 @@ def wake_timing_log_path(cfg: dict) -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_WAKE_TIMING_LOG
 
 
-def wake_signal_log_path(cfg: dict) -> Path:
-    """The ear's wake-signal file: the persistent Monitor `tail -f`s it, the
-    pacemaker appends WAKE/NUDGE lines to it (alive-resident wake only).
-    Default: <cortex_home>/wake_signal.log."""
-    raw = cfg["wake"].get("signal_log") or ""
-    return Path(raw).expanduser() if raw else cortex_home(cfg) / "wake_signal.log"
-
-
 def wake_audit_log_path(cfg: dict) -> Path:
     """Wake-state audit trail (alarm epoch/generation events). Byte-shared with
     marrow's [cortex].wake_audit_log_file so both sides append to one file.
-    Default: <cortex_home>/wake_audit.log. Override via [paths].wake_audit_log."""
+    Default: <cortex_home>/state/wake_audit.log. Override via [paths].wake_audit_log."""
     raw = cfg["paths"].get("wake_audit_log") or ""
-    return Path(raw).expanduser() if raw else cortex_home(cfg) / "wake_audit.log"
+    return Path(raw).expanduser() if raw else state_dir(cfg) / "wake_audit.log"

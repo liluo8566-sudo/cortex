@@ -1,9 +1,13 @@
-"""python -m cortex.install — register/remove the cortex launchd ticks.
+"""python -m cortex.install — register/remove the cortex launchd jobs.
 
 Mirrors marrow's plist install (gui/<uid> domain, template token resolve).
-Tick intervals come from config (tick.collect_interval_sec /
-tick.pacemaker_interval_sec) so cadence stays config-driven, not hand-edited
-into the plist. Cortex owns only its own ticks; hooks/MCP belong to marrow.
+Two jobs: the collect tick (StartInterval from tick.collect_interval_sec, so
+cadence stays config-driven) and the always-on wake daemon (KeepAlive). Cortex
+owns only its own jobs; hooks/MCP belong to marrow.
+
+_RETIRED holds labels this repo used to install (the pacemaker cron). They are
+booted out on both install and remove, but their resolved plist file is left in
+place on disk — it is the rollback path, and deleting it would strand it.
 """
 from __future__ import annotations
 
@@ -27,8 +31,11 @@ _PATH_ENV = (
 
 _PLISTS: list[tuple[str, str]] = [
     ("ct-collect-tick.plist", "com.cortex.collect-tick"),
-    ("ct-pacemaker-tick.plist", "com.cortex.pacemaker-tick"),
+    ("ct-wake-daemon.plist", "com.cortex.wake-daemon"),
 ]
+
+# Retired labels: unloaded, never file-deleted (T11 P4 — rollback insurance).
+_RETIRED: list[str] = ["com.cortex.pacemaker-tick"]
 
 
 def venv_python() -> Path:
@@ -55,8 +62,17 @@ def _resolve(text: str, cfg: dict) -> str:
         .replace("__LOG_DIR__", str(_LOG_DIR))
         .replace("__PATH_ENV__", _PATH_ENV)
         .replace("__COLLECT_INTERVAL_SEC__", str(int(tick["collect_interval_sec"])))
-        .replace("__PACEMAKER_INTERVAL_SEC__", str(int(tick["pacemaker_interval_sec"])))
     )
+
+
+def _bootout_retired(domain: str) -> None:
+    """Unload every retired job. The resolved plist file stays on disk (manual
+    rollback: `launchctl bootstrap <domain> <file>`)."""
+    for label in _RETIRED:
+        tgt = _LAUNCH_AGENTS / f"{label}.plist"
+        if tgt.exists():
+            _launchctl("bootout", domain, str(tgt))
+            print(f"  ok {label} unloaded (plist left in place)")
 
 
 def install_plists() -> bool:
@@ -64,6 +80,7 @@ def install_plists() -> bool:
     _LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     domain = f"gui/{_uid()}"
+    _bootout_retired(domain)
     errors = 0
     for fname, label in _PLISTS:
         src = _DEPLOY_DIR / fname
@@ -81,6 +98,7 @@ def install_plists() -> bool:
 
 def remove_plists() -> None:
     domain = f"gui/{_uid()}"
+    _bootout_retired(domain)
     for _fname, label in _PLISTS:
         tgt = _LAUNCH_AGENTS / f"{label}.plist"
         if not tgt.exists():

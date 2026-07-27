@@ -4,13 +4,13 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.cortex.pacemaker-tick</string>
+  <string>com.cortex.wake-daemon</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>__VENV_PYTHON__</string>
     <string>-m</string>
-    <string>cortex.pacemaker_tick</string>
+    <string>cortex.daemon</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -22,18 +22,21 @@
     <string>__PATH_ENV__</string>
   </dict>
 
-  <key>StartInterval</key>
-  <integer>__PACEMAKER_INTERVAL_SEC__</integer>
-
   <key>RunAtLoad</key>
   <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
 
   <key>ProcessType</key>
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>__LOG_DIR__/ct-pacemaker-tick.log</string>
+  <string>__LOG_DIR__/ct-wake-daemon.log</string>
   <key>StandardErrorPath</key>
-  <string>__LOG_DIR__/ct-pacemaker-tick.log</string>
+  <string>__LOG_DIR__/ct-wake-daemon.log</string>
 </dict>
 </plist>

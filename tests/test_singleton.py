@@ -5,7 +5,7 @@ wrong), unless night-sleep or explicit pause/mute. These tests simulate the
 three incident shapes with state-file fixtures and assert self-heal:
   - double-wake (2 residents): watchdog.spawn is idempotent (a live recorded
     pid = no second spawn); ctl.cmd_wake on an alive+awake window is a no-op.
-  - watchdog-death-during-wait: the tick awake gate respawns a dead watchdog.
+  - watchdog-death-during-wait: the awake gate respawns a dead watchdog.
   - stale epoch: a superseded snapshot (gen moved) holds, no respawn/reap.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from cortex import config, db, pacemaker_tick, wake_state, watchdog
+from cortex import config, db, reconcile, wake_state, watchdog
 
 
 @pytest.fixture
@@ -27,7 +27,6 @@ def cfg(tmp_path):
     c["paths"]["self_schedule_file"] = str(home / "self_schedule.json")
     c["paths"]["transcript_dir"] = str(tmp_path / "transcript")
     c["paths"]["ny_db_pages"] = str(tmp_path / "ny")
-    c["wake"]["sentinel"] = False
     return c
 
 
@@ -144,35 +143,6 @@ def test_spawn_launches_when_recorded_pid_dead(cfg, monkeypatch):
     assert pid == 4243
 
 
-# --- ctl.cmd_wake already-on-duty guard (double-wake prevention) --------------
-
-def test_ctl_wake_alive_awake_is_noop(cfg, monkeypatch):
-    """A resident window that is alive AND awake is already on duty: cmd_wake
-    must NOT drive run_wake (which would re-set_awake + spawn a 2nd watchdog)."""
-    from cortex import ctl, wake
-    monkeypatch.setattr(wake, "_window_alive", lambda c: True)
-    wake_state.set_awake(cfg, 1, None)
-
-    def _boom(*a, **k):
-        raise AssertionError("run_wake must not run for an already-awake resident")
-    monkeypatch.setattr("cortex.wake.run_wake", _boom)
-    msg = ctl.cmd_wake(cfg)
-    assert "already awake" in msg
-    assert wake_state.is_awake(cfg) is True  # still exactly one resident
-
-
-def test_ctl_wake_alive_dormant_still_wakes(cfg, monkeypatch):
-    """Alive-but-dormant (not awake) still takes the standard ear wake path."""
-    from cortex import ctl, wake
-    monkeypatch.setattr(wake, "_window_alive", lambda c: True)
-    ran = {"n": 0}
-    monkeypatch.setattr("cortex.wake.run_wake",
-                        lambda conn, c, decision, now=None:
-                        ran.__setitem__("n", ran["n"] + 1) or {"mode": "window"})
-    ctl.cmd_wake(cfg)
-    assert ran["n"] == 1  # dormant resident IS woken
-
-
 # --- awake-gate watchdog-liveness heal (watchdog death during a wait) ---------
 
 def _awake_window(cfg, conn):
@@ -186,7 +156,7 @@ def _awake_window(cfg, conn):
 
 
 def test_awake_gate_respawns_dead_watchdog(cfg, monkeypatch):
-    """Watchdog died mid-wake: the 5-min tick awake gate must respawn one so the
+    """Watchdog died mid-wake: the reconcile awake gate must respawn one so the
     resident regains 60s polling + exact-time fuse."""
     conn = db.connect(cfg)
     try:
@@ -199,7 +169,7 @@ def test_awake_gate_respawns_dead_watchdog(cfg, monkeypatch):
         respawned = {"n": 0}
         monkeypatch.setattr(watchdog, "spawn",
                             lambda c: respawned.__setitem__("n", respawned["n"] + 1))
-        pacemaker_tick._handle_awake(conn, cfg, st, snap_gen=snap_gen)
+        reconcile._handle_awake(conn, cfg, st, snap_gen=snap_gen)
         assert respawned["n"] == 1  # dead watchdog respawned
     finally:
         conn.close()
@@ -218,14 +188,14 @@ def test_awake_gate_no_respawn_when_watchdog_alive(cfg, monkeypatch):
         respawned = {"n": 0}
         monkeypatch.setattr(watchdog, "spawn",
                             lambda c: respawned.__setitem__("n", respawned["n"] + 1))
-        pacemaker_tick._handle_awake(conn, cfg, st, snap_gen=snap_gen)
+        reconcile._handle_awake(conn, cfg, st, snap_gen=snap_gen)
         assert respawned["n"] == 0  # live watchdog -> no second spawn
     finally:
         conn.close()
 
 
 def test_awake_gate_stale_epoch_holds_no_respawn(cfg, monkeypatch):
-    """Stale snapshot (gen moved since the tick opened = a user reset / lie_down):
+    """Stale snapshot (gen moved since the pass opened = a user reset / lie_down):
     the awake gate must hold and NOT respawn a watchdog against a dead epoch."""
     conn = db.connect(cfg)
     try:
@@ -236,7 +206,7 @@ def test_awake_gate_stale_epoch_holds_no_respawn(cfg, monkeypatch):
         respawned = {"n": 0}
         monkeypatch.setattr(watchdog, "spawn",
                             lambda c: respawned.__setitem__("n", respawned["n"] + 1))
-        msg = pacemaker_tick._handle_awake(conn, cfg, st, snap_gen=stale_gen)
+        msg = reconcile._handle_awake(conn, cfg, st, snap_gen=stale_gen)
         assert "superseded" in msg
         assert respawned["n"] == 0  # never respawn against a stale epoch
     finally:

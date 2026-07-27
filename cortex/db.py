@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS ct_wake_log (
     dry_run INTEGER NOT NULL,
     reasons TEXT,
     gated_by TEXT,
-    explanation TEXT
+    explanation TEXT,
+    shell TEXT NOT NULL DEFAULT 'cli'
 );
 
 CREATE TABLE IF NOT EXISTS ct_pacemaker_state (
@@ -120,11 +121,15 @@ def connect_path(path: Path) -> sqlite3.Connection:
 # read by the wakeup note + daily budget. force_slept marks a proxy lie-down.
 # net_tokens is HISTORICAL — kept only so old rows survive the migration; no
 # code writes or reads it any more (Cortex Today now sums per-window final
-# occupancy, not a per-wake net delta).
+# occupancy, not a per-wake net delta). shell = which shell the row belongs to
+# ('cli' | 'tg'); existing rows backfill to 'cli' via the column default, and
+# the note's force-slept marker is filtered by it so one shell never shows
+# another shell's sleep.
 _ADDED_COLUMNS = (
     ("ct_wake_log", "tokens", "INTEGER"),
     ("ct_wake_log", "force_slept", "TEXT"),
     ("ct_wake_log", "net_tokens", "INTEGER"),
+    ("ct_wake_log", "shell", "TEXT NOT NULL DEFAULT 'cli'"),
 )
 
 

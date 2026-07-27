@@ -5,8 +5,8 @@ probe. Every external source is wrapped in try/except so a failure omits its
 line rather than crashing the wake. render() is pure — no I/O, no DB — so it
 can be unit-tested with synthetic data.
 
-Layout: a header block (Now / Plan Used / Active), then `---`-separated blocks
-for pending self-schedule and Replay. The handoff injects at
+Layout: a header block (Now / Active), then `---`-separated blocks
+for pending self-schedule. The handoff injects at
 SessionStart (marrow), not here. Cal/Rem lines retired (global inject pending).
 The old "Wake:" reason line is gone — reasons carry no signal (desire engine
 retired, wander-only).
@@ -14,31 +14,21 @@ retired, wander-only).
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sqlite3
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, tzinfo
+from pathlib import Path
 
 from cortex import config
-from cortex.pacemaker.integration import parse_due_at
-from cortex.pacemaker.integration import _today_tokens as _integration_today_tokens
-
-# ct_rate_limit is a flat kv table (key, value, updated_at) the marrow-side
-# collector owns (usage_snapshot). Keys read here: five_hour_pct /
-# five_hour_reset_at, seven_day_pct / seven_day_reset_at, today_net_tokens.
-# Any missing key -> that segment is omitted.
-_FIVE_HOUR = ("five_hour_pct", "five_hour_reset_at")
-_SEVEN_DAY = ("seven_day_pct", "seven_day_reset_at")
-_TODAY_NET_KEY = "today_net_tokens"
+from cortex.occupancy import parse_due_at
 
 # A wake row younger than this many seconds is treated as *this* wake (the tick
 # logs it before the note is assembled), so "Last wake" reports the one before.
 _CURRENT_WAKE_EPSILON_S = 90
 
 
-def _tz(cfg: dict) -> ZoneInfo:
-    return ZoneInfo(cfg.get("core", {}).get("timezone", "Australia/Melbourne"))
+def _tz(cfg: dict) -> tzinfo:
+    return config.get_tz(cfg)
 
 
 def _parse_utc(ts_iso: str) -> datetime:
@@ -53,29 +43,232 @@ def _note_cfg(cfg: dict) -> dict:
     return cfg.get("note", {}) or {}
 
 
-# Channels whose turns are cortex self-talk (wake monologues), excluded from
-# Replay so the wakeup note does not replay itself back into its own context.
-_DEFAULT_REPLAY_EXCLUDE_CHANNELS = ("ct",)
+class _ClampDefaults(dict):
+    """format_map source that leaves unknown placeholders literal, so a custom
+    turn_end_text template never crashes on a placeholder not in the clamp set."""
+    def __missing__(self, key):
+        return "{" + key + "}"
 
 
-def _replay_exclude_channels(cfg: dict) -> tuple[str, ...]:
-    raw = _note_cfg(cfg).get("replay_exclude_channels")
-    if raw is None:
-        return _DEFAULT_REPLAY_EXCLUDE_CHANNELS
-    return tuple(str(c) for c in raw if str(c).strip())
+def _consume_kick_reasons(cfg: dict, ws: dict, settle: bool = True) -> list[str]:
+    """Read the pending kick reason flags (cortex.kick appended them under the
+    strict lock). settle=True CLEARS exactly those from wake_state (a real
+    injection settles them); settle=False PEEKS — renders them without clearing
+    so a passive re-render / a frozen note that may be discarded surfaces them
+    again (pending-visible; at-least-once). Called only by consume_kick=True
+    paths. Reasons that arrived between the load and the clear are preserved
+    (list-tail re-read). Best-effort: any lock failure returns the loaded reasons
+    WITHOUT clearing — a duplicate reason line beats a lost wake signal."""
+    reasons = ws.get("kick_reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return []
+    reasons = [str(r) for r in reasons if str(r).strip()]
+    if not reasons:
+        return []
+    if not settle:
+        return reasons
+    n = len(reasons)
+    try:
+        from cortex import wake_state
+
+        def _clear(d: dict):
+            cur = d.get("kick_reasons")
+            if isinstance(cur, list):
+                d["kick_reasons"] = cur[n:]
+                if not d["kick_reasons"]:
+                    d.pop("kick_reasons", None)
+            return None
+
+        wake_state.conditional_mutate(cfg, None, _clear)
+    except Exception:
+        pass
+    return reasons
+
+
+def _receipt_channel(cfg: dict) -> str:
+    """from_channel tag on cortex-authored outbox notes (msg tool stamps it)."""
+    return str(_note_cfg(cfg).get("cortex_channel") or "ct")
+
+
+def _consume_receipts(cfg: dict, conn: sqlite3.Connection, now: datetime,
+                      settle: bool = True) -> list[str]:
+    """Reply receipts (P12/C11): outbox notes cortex sent that she has replied to
+    but not yet shown (receipt_seen=0, replied_at NOT NULL). Render one C11 line
+    each. settle=True stamps receipt_seen=1 (a real injection settles it, so the
+    receipt shows exactly once); settle=False PEEKS — renders without stamping so
+    a passive re-render / discarded frozen note surfaces it again. Called only
+    from consume_kick=True paths; render-only re-renders never stamp. Best-effort:
+    any DB error -> no receipts, no stamp. Blank template -> receipts disabled."""
+    tmpl = str(_note_cfg(cfg).get("receipt_line") or "").strip()
+    if not tmpl or conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT id, target, sent_at, replied_at, reply_text FROM outbox"
+            " WHERE from_channel=? AND replied_at IS NOT NULL AND receipt_seen=0"
+            " ORDER BY id",
+            (_receipt_channel(cfg),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    if not rows:
+        return []
+    lines: list[str] = []
+    for r in rows:
+        sent_hm = _local_hm(r["sent_at"], cfg) if r["sent_at"] else "?"
+        replied_hm = _local_hm(r["replied_at"], cfg) if r["replied_at"] else "?"
+        text = " ".join((r["reply_text"] or "").split())
+        try:
+            lines.append(tmpl.format(id=r["id"], channel=r["target"] or "?",
+                                     sent_hm=sent_hm, replied_hm=replied_hm,
+                                     text=text))
+        except (KeyError, IndexError, ValueError):
+            lines.append(tmpl)
+    if settle:
+        try:
+            ids = [r["id"] for r in rows]
+            qmarks = ",".join("?" for _ in ids)
+            with conn:
+                conn.execute(
+                    f"UPDATE outbox SET receipt_seen=1 WHERE id IN ({qmarks})",
+                    ids)
+        except sqlite3.Error:
+            pass
+    return lines
+
+
+def _render_ct_note(cfg: dict, row: sqlite3.Row) -> str:
+    """One ct-targeted outbox note: [outbox].inject_header + body verbatim. Mirror
+    of marrow outbox._render_note so hook-delivered and note-delivered notes read
+    identically (same header, same placeholders channel/sid4/time)."""
+    tmpl = str((cfg.get("outbox", {}) or {}).get("inject_header") or "")
+    from_sid = row["from_sid"] or ""
+    sid4 = from_sid[:4] if from_sid else "????"
+    hhmm = _local_hm(row["created_at"], cfg) if row["created_at"] else ""
+    if tmpl:
+        try:
+            header = tmpl.format(channel=row["from_channel"] or "?", sid4=sid4,
+                                 time=hhmm)
+        except (KeyError, IndexError, ValueError):
+            header = tmpl
+        return f"{header}\n{row['body']}"
+    return str(row["body"] or "")
+
+
+def _consume_ct_notes(cfg: dict, conn: sqlite3.Connection,
+                      claimed_by: str = "cortex.note",
+                      settle: bool = False) -> list[str]:
+    """Claim + render outbox notes targeting the cortex window (target='ct').
+    At-most-once claim via the SAME atomic UPDATE marrow's hook uses (WHERE
+    status='pending', guarded on rowcount) — exactly-one-owner. Also re-renders
+    rows still in the 'claimed' pending-visible state (a prior assemble froze
+    them into a note that never reached the model) so the payload surfaces again.
+
+    settle (default False): the claim leaves the row 'claimed' = pending-visible;
+    ONLY a real injection settles it to 'sent'. The free-round path passes
+    settle=True (its ear write is the injection); the wake-assemble path leaves
+    settle=False so the marrow hook (the actual injector) settles it. Called only
+    from VISIBLE-round paths — never a passive re-render or off-screen tick.
+    `claimed_by` stamps the audit column. Best-effort."""
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT id FROM outbox WHERE status='pending' AND target='ct'"
+            " ORDER BY id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    owned: list[int] = []
+    for r in rows:
+        rid = r["id"]
+        try:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE outbox SET status='claimed', claimed_by=?,"
+                    " claimed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+                    " WHERE id=? AND status='pending'",
+                    (claimed_by, rid))
+            if cur.rowcount != 1:
+                continue  # lost the claim race (hook took it) — skip
+            owned.append(rid)
+        except sqlite3.Error:
+            continue
+    try:
+        prior = conn.execute(
+            "SELECT id FROM outbox WHERE status='claimed' AND target='ct'"
+            " ORDER BY id").fetchall()
+    except sqlite3.OperationalError:
+        prior = []
+    ids = sorted({r["id"] for r in prior} | set(owned))
+    delivered: list[str] = []
+    for rid in ids:
+        try:
+            full = conn.execute(
+                "SELECT id, created_at, from_sid, from_channel, body"
+                " FROM outbox WHERE id=?", (rid,)).fetchone()
+            if full is not None:
+                delivered.append(_render_ct_note(cfg, full))
+        except sqlite3.Error:
+            continue
+    if settle and ids:
+        try:
+            qmarks = ",".join("?" for _ in ids)
+            with conn:
+                conn.execute(
+                    "UPDATE outbox SET status='sent',"
+                    " sent_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+                    " WHERE id IN (" + qmarks + ")", ids)
+        except sqlite3.Error:
+            pass
+    return delivered
+
+
+def claim_ct_notes_text(cfg: dict, conn: sqlite3.Connection,
+                        claimed_by: str) -> str:
+    """Claim + render pending ct-notes as one joined block (own connection at the
+    caller). Used by the free-round path to consume notes ONLY after its ear write
+    has committed — so an off-screen tick never swallows a note. Returns "" when
+    none. Best-effort: any error -> "" (no claim)."""
+    try:
+        notes = _consume_ct_notes(cfg, conn, claimed_by=claimed_by, settle=True)
+    except Exception:
+        return ""
+    return "\n\n".join(n for n in notes if n)
+
+
+def _peek_ct_notes(cfg: dict, conn: sqlite3.Connection) -> list[str]:
+    """Read-only render of pending-visible ct notes (status='claimed', not yet
+    settled to 'sent'). A passive re-render (marrow render_module / --print-note /
+    SessionStart) shows an un-injected note again WITHOUT claiming, settling, or
+    mutating any row. Best-effort -> []."""
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at, from_sid, from_channel, body"
+            " FROM outbox WHERE status='claimed' AND target='ct' ORDER BY id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [_render_ct_note(cfg, r) for r in rows]
 
 
 # --------------------------------------------------------------------------- #
 # DB-sourced facts
 # --------------------------------------------------------------------------- #
 
-def _last_wake(conn: sqlite3.Connection, now: datetime) -> dict | None:
-    """Previous wake=1 row's age + force_slept marker. Skips a row logged for
-    the current wake (younger than the epsilon)."""
+def _last_wake(conn: sqlite3.Connection, now: datetime,
+               shell: str | None = None) -> dict | None:
+    """Previous wake=1 row's age + force_slept marker for THIS shell (rows carry
+    a shell column, default 'cli'), so one shell's force-slept marker can never
+    surface on another shell's page. Skips a row logged for the current wake
+    (younger than the epsilon)."""
     try:
         rows = conn.execute(
-            "SELECT ts, force_slept FROM ct_wake_log WHERE wake = 1 "
-            "ORDER BY ts DESC LIMIT 3"
+            "SELECT ts, force_slept FROM ct_wake_log WHERE wake = 1 AND shell = ? "
+            "ORDER BY ts DESC LIMIT 3",
+            (shell or CLI_SHELL,),
         ).fetchall()
     except sqlite3.OperationalError:
         return None
@@ -94,207 +287,32 @@ def _last_wake(conn: sqlite3.Connection, now: datetime) -> dict | None:
     return None
 
 
-def _handoff_after(cfg: dict, prev_ts: str | None) -> bool:
-    """True if the handoff file is non-empty and was modified after `prev_ts`
-    (the prior wake=1 row's ISO-UTC ts). Uses the DB row ts as the stable
-    reference (wake_state.awake_since is cleared by lie_down / rewritten by
-    external resets, so it is not reliable here)."""
-    if not prev_ts:
-        return False
-    try:
-        prev_epoch = _parse_utc(prev_ts).timestamp()
-    except (TypeError, ValueError):
-        return False
-    from cortex import config as _config
-    handoff = _config.handoff_path(cfg)
-    try:
-        if not handoff.exists() or handoff.stat().st_mtime <= prev_epoch:
-            return False
-        return bool(handoff.read_text(encoding="utf-8").strip())
-    except OSError:
-        return False
-
-
-def _today_tokens(conn: sqlite3.Connection, now: datetime) -> int:
-    """Cortex Today = sum of today's finished-window final occupancies + the
-    current live window occupancy. Delegates to the daily-budget gate's helper
-    (pacemaker.integration._today_tokens) so the note line and the gate always
-    show the same figure (parity by construction, not by two copies)."""
-    return _integration_today_tokens(conn, now)
-
-
-def _rate_limit_kv(conn: sqlite3.Connection) -> dict:
-    try:
-        rows = conn.execute("SELECT key, value FROM ct_rate_limit").fetchall()
-    except sqlite3.OperationalError:
-        return {}
-    return {row["key"]: row["value"] for row in rows}
-
-
-def _window_tokens(conn: sqlite3.Connection) -> int | None:
-    """Window occupancy hint (statusline total: input + cache_read +
-    cache_creation + output) published by lie_down / watchdog into
-    ct_pacemaker_state JSON under 'window_tokens'. Absent -> None (segment
-    omitted). Rendered as the Budget 'Net Session Token: Xk' segment."""
+def _last_active(conn: sqlite3.Connection, cfg: dict, now: datetime,
+                 shell: str | None = None) -> dict | None:
+    """Age of THIS shell's last reply, from the newest ct_activity row whose
+    channel is the shell id (cli / tg / wx). Cortex stopped being a standalone
+    channel when it moved inside the tg/cli shells, so the activity rows now
+    carry the host shell's channel. At inject time the current turn's Stop has
+    not fired, so the newest row is the previous reply — no epsilon skip needed.
+    None when the table is absent or has no row for this shell."""
     try:
         row = conn.execute(
-            "SELECT state FROM ct_pacemaker_state WHERE id = 1"
+            "SELECT MAX(ts) AS ts FROM ct_activity WHERE channel = ?",
+            (shell or CLI_SHELL,),
         ).fetchone()
     except sqlite3.OperationalError:
         return None
-    if not row:
+    if not row or not row["ts"]:
         return None
     try:
-        state = json.loads(row["state"])
-    except (ValueError, TypeError):
-        return None
-    val = state.get("window_tokens")
-    try:
-        return int(val) if val is not None else None
+        age = now - _parse_utc(row["ts"])
     except (TypeError, ValueError):
         return None
+    return {"minutes_ago": int(age.total_seconds() // 60), "ts": row["ts"]}
 
 
-# Media / bridge-marker shaper — deliberate copy of marrow strip_media_markers
-# (marrow/marrow/transcript.py:102; marrow not importable from the cortex env).
-# Keep byte-identical with that pairing. Strips wx [time:]/[sticker:] markers and
-# <image|file|gif path="..."/> tags so replayed rows read like plain dialogue.
-_TIME_PREFIX_RE = re.compile(r"^\[time:[^\]]+\]\s*")
-_STICKER_LINE_RE = re.compile(r"^\[sticker:[^\]\n]*\]\n?", re.M)
-_MEDIA_TAG_RE = re.compile(r'\s*<(?:image|file|gif)\s+path="[^"]*?"[^>]*>\s*')
+CLI_SHELL = "cli"
 
-
-def _strip_markers(text: str) -> str:
-    if not text:
-        return ""
-    text = _TIME_PREFIX_RE.sub("", text)
-    text = _STICKER_LINE_RE.sub("", text)
-    return _MEDIA_TAG_RE.sub(" ", text).strip()
-
-
-def _replay(conn: sqlite3.Connection, cfg: dict, limit: int, per_chars: int,
-            since_ts: str | None = None) -> tuple[list[dict], str | None]:
-    """Fetch the replay events AND the exact cutoff of the RENDERED subset in a
-    single read. Returns (events, cutoff_ts).
-
-    events: last `limit` real user/assistant events (cross-session,
-    chronological), each tagged [channel HH:mm] + role marker (N=user,
-    Y=assistant) and capped at per_chars. Excludes role='tl' and cortex
-    self-talk channels.
-
-    cutoff_ts: the max raw timestamp of the events actually returned, i.e. the
-    cutoff of exactly what was rendered — never a re-query of the newest event
-    overall. When more new rows exist than `limit`, the query keeps only the
-    newest `limit` (ORDER BY id DESC LIMIT), so cutoff is the newest of that
-    rendered subset; older-but-still-new overflow rows below the limit are NOT
-    covered by this cutoff and remain replayable on the next round (the caller
-    that seeds/advances the baseline uses this cutoff, so overflow is never
-    skipped). When no eligible events are returned, cutoff_ts is None — the
-    caller keeps the prior baseline (no advance, no rewind).
-
-    `since_ts` (diff mode, D6): only events with timestamp > since_ts — a
-    free-round tuck-in replays what happened since the wake's last rendered
-    note, not the whole wake. None = full replay (epoch zero / wake's initial
-    note).
-
-    Replay is meant to show the real user<->assistant exchange context; cortex's
-    own wake monologues (channel='ct') are excluded so the note does not replay
-    itself. The excluded channel set is config-driven (note.replay_exclude_channels)."""
-    if limit <= 0:
-        return [], None
-    exclude = _replay_exclude_channels(cfg)
-    placeholders = ",".join("?" for _ in exclude) if exclude else ""
-    where_channel = (
-        f" AND COALESCE(channel,'') NOT IN ({placeholders})" if exclude else "")
-    where_since = " AND timestamp > ?" if since_ts else ""
-    params = (*exclude, *((since_ts,) if since_ts else ()), limit)
-    try:
-        rows = conn.execute(
-            "SELECT role, content, timestamp, channel FROM events "
-            "WHERE role IN ('user', 'assistant')" + where_channel + where_since
-            + " ORDER BY id DESC LIMIT ?",
-            params,
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return [], None
-    events = []
-    cutoff_ts: str | None = None
-    for row in reversed(rows):  # chronological
-        ts = row["timestamp"]
-        content = _strip_markers(row["content"])
-        if not content:
-            continue
-        # Cutoff tracks the max ts of the RENDERED subset only. Rows are the
-        # newest `limit` (ORDER BY id DESC LIMIT), reversed to chronological, so
-        # the last kept row carries the newest ts. Guard on value in case of
-        # non-monotonic ts across the window.
-        if ts and (cutoff_ts is None or ts > cutoff_ts):
-            cutoff_ts = ts
-        events.append({
-            "channel": row["channel"] or "?",
-            "hm": _local_hm(ts, cfg) if ts else "??:??",
-            "role": "N" if row["role"] == "user" else "Y",
-            "content": _truncate(content, per_chars),
-        })
-    return events, cutoff_ts
-
-
-def _replay_events(conn: sqlite3.Connection, cfg: dict, limit: int, per_chars: int,
-                   since_ts: str | None = None) -> list[dict]:
-    """Thin wrapper: the rendered replay events only (drops the cutoff). See
-    `_replay` for the full contract."""
-    return _replay(conn, cfg, limit, per_chars, since_ts)[0]
-
-
-_OMITTED = object()
-
-
-def seed_baseline(conn: sqlite3.Connection, cfg: dict,
-                  cutoff_ts=_OMITTED) -> None:
-    """Seed the diff-mode replay baseline (wake_state.last_note_ts) so the FIRST
-    free-round tuck-in diffs from the wake-open moment, not epoch zero (D6:
-    baseline = the wake's initial note). Called once per wake AFTER set_awake
-    (which resets last_note_ts=None).
-
-    `cutoff_ts` (P2-A): the replay cutoff captured when the wake's initial note
-    was assembled. Semantics by value:
-      - a truthy ts  -> seed that ts verbatim (the baseline must be EXACTLY the
-        cutoff of what was rendered, never a later re-query that could race in an
-        event the note never showed and drop it from the first free-round).
-      - explicit None -> the assembled note had ZERO eligible replay events; seed
-        NOTHING, keep the baseline as-is (#2). run_wake always passes the note's
-        captured cutoff, so None here is a valid empty note, NOT an omitted arg.
-      - OMITTED (arg not passed) -> legacy / test callers with no captured cutoff;
-        fall back to a fresh _latest_replay_ts query.
-
-    No-op when there is nothing to seed. Never raises — a failed seed just falls
-    back to full replay on the first free-round."""
-    try:
-        from cortex import wake_state
-        if cutoff_ts is _OMITTED:
-            latest_ts = _latest_replay_ts(conn, cfg)
-        else:
-            latest_ts = cutoff_ts
-        if latest_ts:
-            wake_state.set_last_note_ts(cfg, latest_ts)
-    except Exception:
-        pass
-
-
-def _latest_replay_ts(conn: sqlite3.Connection, cfg: dict) -> str | None:
-    """ISO timestamp of the most recent non-ct user/assistant event, or None."""
-    exclude = _replay_exclude_channels(cfg)
-    ph = ",".join("?" for _ in exclude) if exclude else ""
-    where_ch = f" AND COALESCE(channel,'') NOT IN ({ph})" if exclude else ""
-    try:
-        row = conn.execute(
-            "SELECT MAX(timestamp) as ts FROM events "
-            "WHERE role IN ('user', 'assistant')" + where_ch,
-            (*exclude,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
-    return row["ts"] if row and row["ts"] else None
 
 
 # --------------------------------------------------------------------------- #
@@ -372,40 +390,37 @@ def gather(
     *,
     fresh: bool = False,
     wake_kind: str | None = None,
-    died_no_handoff: bool = False,
     window_sid: str | None = None,
-    advance_baseline: bool = False,
+    consume_kick: bool = False,
+    claim_ct_notes: bool = True,
+    settle: bool = False,
+    shell: str | None = None,
 ) -> dict:
     """Assemble the wakeup note data dict. conn must use sqlite3.Row factory.
     `fresh`/`wake_kind` are accepted for caller compatibility; the handoff
-    now injects at SessionStart, not here. `died_no_handoff` = the prior window
-    crashed without a handoff (respawn catchup line).
+    now injects at SessionStart, not here.
 
     `window_sid` (caller-supplied) overrides the wake_state transcript for the
     Window line — the caller's own transcript stem is correct even after a
     rotation, whereas wake_state.transcript was cleared at lie_down and is only
     re-set after this note is written. awake_since still comes from wake_state.
 
-    `advance_baseline` (default False): move the diff-mode replay baseline
-    (wake_state.last_note_ts) to the newest eligible event. ONLY the free-round
-    tuck-in path passes True — each free-round consumes the events it showed so
-    the next one diffs from here. Every render-only path (marrow render_module /
-    --print-note / any SessionStart re-render) MUST leave this False, else a
-    passive re-render advances the baseline and the next real free-round silently
-    drops replay events."""
-    ncfg = _note_cfg(cfg)
+    `settle` (default False): kick reasons / receipts / ct notes are pending-
+    visible — a claim/read does NOT consume them; ONLY a real payload injection
+    settles them (clear/stamp/mark-sent). settle=True is passed by injection
+    paths (free-round ear write). The wake-assemble path leaves settle=False (its
+    frozen note may be discarded — the marrow hook is the real injector). A
+    passive re-render (consume_kick=False) PEEKS all three read-only so an
+    un-injected payload surfaces again — never consumes, never settles.
 
+    `shell` (default None = the unqualified/cli render): the shell this note is
+    rendered for. It scopes the wake ledger read (ct_wake_log.shell) AND the
+    last-active read (ct_activity.channel), so one shell's page never shows
+    another shell's rows."""
     from cortex import wake_state
 
-    kv = _safe(_rate_limit_kv, conn, default={})
-    budget = _safe(_build_budget, conn, cfg, now, kv, ncfg)
-    last_wake = _safe(_last_wake, conn, now)
-    # Catchup suppression: the prior window may have been reaped (force_slept set)
-    # yet still wrote its handoff before dying. If the handoff was touched after
-    # that prior wake row's ts and is non-empty, there is nothing to backfill ->
-    # skip the catchup line and its 30-40k token re-read.
-    catchup_handoff_written = bool(
-        last_wake and _handoff_after(cfg, last_wake.get("ts")))
+    last_wake = _safe(_last_wake, conn, now, shell)
+    last_active = _safe(_last_active, conn, cfg, now, shell)
 
     ws = {}
     try:
@@ -417,7 +432,6 @@ def gather(
         transcript_raw = ws.get("transcript")
         if transcript_raw:
             try:
-                from pathlib import Path
                 window_sid = Path(str(transcript_raw)).stem[:8]
             except Exception:
                 pass
@@ -428,136 +442,49 @@ def gather(
             awake_since_hm = since_dt.astimezone(_tz(cfg)).strftime("%H:%M")
         except (TypeError, ValueError):
             pass
-    # Diff mode (D6): replay only events newer than the last rendered note this
-    # wake (last_note_ts). Absent (wake's initial note, or wake_state load
-    # failed) -> full replay, same as before this refactor.
-    note_since_ts = ws.get("last_note_ts")
-    replay, rendered_cutoff = _safe(
-        _replay, conn, cfg,
-        ncfg.get("replay_events", 4),
-        ncfg.get("replay_event_chars", 300),
-        note_since_ts,
-        default=([], None),
-    )
-    replay_stale = False
-    if last_wake:
-        # Use the exact prior-wake ts (last_wake["ts"]), never the floored
-        # minutes_ago reconstruction: int(seconds // 60) truncates, so
-        # now - timedelta(minutes=minutes_ago) can land up to 59s AFTER the
-        # real wake, moving the stale boundary forward and wrongly staling an
-        # event that arrived just after the real wake.
-        try:
-            last_wake_dt = _parse_utc(last_wake["ts"])
-        except (TypeError, ValueError, KeyError):
-            last_wake_dt = None
-        if last_wake_dt is not None:
-            if not replay:
-                # No new eligible events this render. If the newest event overall
-                # predates this wake, mark the replay stale ("no new messages") — a
-                # cheap read used only for the human-facing line, never for cutoff.
-                latest_ts = _safe(_latest_replay_ts, conn, cfg)
-                if latest_ts:
-                    try:
-                        replay_stale = _parse_utc(latest_ts) < last_wake_dt
-                    except (TypeError, ValueError):
-                        pass
-            elif note_since_ts is None and rendered_cutoff:
-                # Initial-wake FULL replay (no diff baseline yet): _replay applied
-                # no since filter, so it can return events that all PREDATE this
-                # wake. Their newest (rendered_cutoff) older than the prior wake =
-                # nothing fresh -> "no new messages", not a fake-fresh "### Replay"
-                # of an old conversation. Reuses rendered_cutoff (no extra query).
-                try:
-                    if _parse_utc(rendered_cutoff) < last_wake_dt:
-                        replay_stale = True
-                except (TypeError, ValueError):
-                    pass
-    # The replay cutoff this render actually used: the max ts of the RENDERED
-    # subset (rendered_cutoff), or the diff baseline it started from when nothing
-    # new was rendered. Derived from the same read as `replay` — never a separate
-    # re-query, which could race in an event this note never showed and then drop
-    # it from the next round (P2-A / P2-B / #1). With more new rows than the render
-    # limit, rendered_cutoff is the newest of the rendered subset only, so overflow
-    # rows below the limit stay > baseline and replay next round (never skipped).
-    replay_cutoff_ts = rendered_cutoff or note_since_ts
-    # Advance the diff-mode baseline to the cutoff of what was rendered, so the
-    # NEXT free-round tuck-in diffs from here. Monotonic: only moves forward.
-    # Gated on advance_baseline: render-only callers never write it.
-    if advance_baseline and rendered_cutoff and (
-            not note_since_ts or rendered_cutoff > note_since_ts):
-        _safe(wake_state.set_last_note_ts, cfg, rendered_cutoff)
-
-    kick = None
-    try:
-        from cortex.kick import read_signal
-        kick = read_signal(cfg)
-    except Exception:
-        pass
+    # Kick reason flags (cortex.kick): plain lines (no header). Pending-visible:
+    # peek (render, no clear) on any read; settle (clear) only when an injection
+    # path passes consume_kick+settle. A passive re-render (consume_kick=False)
+    # always peeks so an un-injected kick reason surfaces again — never lost to a
+    # discarded frozen note.
+    kick_reasons = _consume_kick_reasons(cfg, ws, settle=consume_kick and settle)
+    # Reply receipts (C11): same pending-visible rule — only an injection stamps
+    # receipt_seen, so a passive re-render peeks without stamping.
+    receipts = _consume_receipts(cfg, conn, now, settle=consume_kick and settle)
+    # ct-targeted outbox notes (F9): claimed + rendered here only on a VISIBLE
+    # round — the wake-bell payload (claim_ct_notes default True). The background
+    # free-round render passes claim_ct_notes=False and claims separately AFTER
+    # its ear write commits (see watchdog._deliver_ct_notes_to_ear), so a tick that
+    # renders off-screen never swallows a note no turn will show.
+    if consume_kick and claim_ct_notes:
+        # Wake-bell payload: claim pending ct notes into the pending-visible
+        # 'claimed' state; settle to 'sent' only when the caller injects
+        # (settle=True). Re-renders own un-settled claims too.
+        ct_notes = _consume_ct_notes(cfg, conn, settle=settle)
+    else:
+        # Passive re-render (marrow render_module / --print-note / off-screen
+        # tick): render already-claimed-but-unsettled ct notes read-only so an
+        # un-injected payload surfaces again — never claims, never settles.
+        ct_notes = _peek_ct_notes(cfg, conn)
 
     return {
-        "replay_cutoff_ts": replay_cutoff_ts,
+        "kick_reasons": kick_reasons,
+        "receipts": receipts,
+        "ct_notes": ct_notes,
         "last_wake": last_wake,
-        "budget": budget,
+        "last_active": last_active,
         "active_app": _safe(_frontmost_app),
         "pending": _safe(_pending, cfg, now, default=[]),
-        "died_no_handoff": died_no_handoff,
-        "replay": replay,
-        "replay_stale": replay_stale,
         "window_sid": window_sid,
         "awake_since_hm": awake_since_hm,
-        "catchup_handoff_written": catchup_handoff_written,
-        "kick": kick,
     }
-
-
-def _build_budget(conn, cfg, now, kv, ncfg) -> dict:
-    five = kv.get(_FIVE_HOUR[0])
-    seven = kv.get(_SEVEN_DAY[0])
-    five_reset = kv.get(_FIVE_HOUR[1])
-    seven_reset = kv.get(_SEVEN_DAY[1])
-    return {
-        "five_h_pct": _as_float(five),
-        "five_h_reset": _local_hm(five_reset, cfg) if five_reset else None,
-        "seven_d_pct": _as_float(seven),
-        "seven_d_countdown": _countdown(seven_reset, now) if seven_reset else None,
-        "window_tokens": _window_tokens(conn),
-        "today_tokens": _today_tokens(conn, now),
-        "daily_budget": int(ncfg.get("daily_budget", 1_000_000)),
-    }
-
-
-def _countdown(reset_iso: str, now: datetime) -> str | None:
-    """Remaining time until an ISO reset moment as a compact `1d2h`/`5h`/`12m`
-    string. Past/unparseable -> None (segment omitted)."""
-    try:
-        delta = _parse_utc(reset_iso) - now.astimezone(ZoneInfo("UTC"))
-    except (TypeError, ValueError):
-        return None
-    secs = int(delta.total_seconds())
-    if secs <= 0:
-        return None
-    days, rem = divmod(secs, 86400)
-    hours, rem = divmod(rem, 3600)
-    mins = rem // 60
-    if days:
-        return f"{days}d{hours}h" if hours else f"{days}d"
-    if hours:
-        return f"{hours}h{mins}m" if mins else f"{hours}h"
-    return f"{mins}m"
-
-
-def _as_float(raw):
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
 
 
 def render(cfg: dict, now: datetime, data: dict) -> str:
     """Pure assembly: data dict -> wakeup note text. No DB / no I/O.
 
-    Layout (plan §一): a header block (Now / Plan Used / Active), then
-    `---`-separated blocks for pending self-schedule and Replay, then a final
+    Layout (plan §一): a header block (Now / Active), then
+    `---`-separated blocks for pending self-schedule, then a final
     turn-end reminder line (note.turn_end_text, every render; "" omits it).
     Handoff no longer lives here — it is injected at SessionStart on a
     fresh window."""
@@ -565,141 +492,70 @@ def render(cfg: dict, now: datetime, data: dict) -> str:
 
     now_seg = f"Now: {now.strftime('%H:%M %a')}"
     last = data.get("last_wake")
-    if last:
-        seg = f"Last wake: {last['minutes_ago']}min ago"
+    # Minutes from the cortex session's last reply (ct_activity); fall back to
+    # the prior wake row's age so the line never disappears when activity is
+    # missing. force_slept marker always sourced from the wake row.
+    active = data.get("last_active") or last
+    if active:
+        seg = f"Last active: {active['minutes_ago']}min ago"
         # "auto" = routine proxy sleep on the silence path -> render neutrally,
-        # never as a force incident. Only real force incidents get the tag.
-        if last.get("force_slept") and last.get("force_slept") != "auto":
-            seg += " (force-slept mid-task)"
+        # never as a force incident. Only real force incidents get the tag, and
+        # the tag names the raw reason (ct-pause / fuse / stale).
+        reason = last.get("force_slept") if last else None
+        if reason and reason != "auto":
+            seg += f" (force-slept: {reason})"
         now_seg += f" | {seg}"
     header.append(now_seg)
-
-    budget_line = _render_budget(data.get("budget"))
-    if budget_line:
-        header.append(budget_line)
 
     app = data.get("active_app")
     if app:
         header.append(f"Active (Mac): {app}")
 
-    w_sid = data.get("window_sid")
-    w_since = data.get("awake_since_hm")
-    if w_sid or w_since:
-        parts = []
-        if w_since:
-            parts.append(f"since {w_since}")
-        if w_sid:
-            parts.append(f"SID {w_sid}")
-        header.append("Window: " + " | ".join(parts))
-
-    # Prior window was force-slept without writing its handoff -> tell this
-    # window to backfill from DB events (recall/tl), never from raw jsonl.
-    # "auto" (routine silence sleep) is not an incident -> no catchup line.
-    # If the handoff was written after the prior wake (catchup_handoff_written),
-    # there is nothing to backfill -> skip the catchup + its costly re-read.
-    if (last and last.get("force_slept") and last.get("force_slept") != "auto"
-            and not data.get("catchup_handoff_written")):
-        catchup = _note_cfg(cfg).get("force_slept_catchup_text", "")
-        if catchup:
-            header.append(catchup)
-
-    # Prior window DIED (crash/manual close) mid-wake without a handoff -> the
-    # fresh respawn recovers from its transcript.
-    if data.get("died_no_handoff"):
-        catchup = _note_cfg(cfg).get("died_no_handoff_catchup_text", "")
-        if catchup:
-            header.append(catchup)
-
     blocks: list[str] = ["\n".join(header)]
 
-    kick = data.get("kick")
-    if kick:
-        kind = kick.get("kind", "?")
-        if kind == "reply":
-            reply_text = kick.get("text", "")
-            seg = "**Kick: reply received on TG/WX** — check outbox for fired watches."
-            if reply_text:
-                seg += f"\nHer reply: {reply_text}"
-            blocks.append(seg)
-        elif kind == "timeout":
-            blocks.append("**Kick: watch_reply timeout** — she hasn't replied; check outbox for fired watches.")
-        elif kind == "morning":
-            blocks.append("**Kick: morning flag-pull** — night mode clearing, resume day cadence.")
-        elif kind == "ack":
-            ack_text = kick.get("text", "")
-            blocks.append(f"💌 已阅章：{ack_text}" if ack_text else "💌 已阅章")
-        else:
-            blocks.append(f"**Kick: {kind}** — check outbox.")
+    # External-wake (cortex.kick) reasons: plain lines, one per reason, NO
+    # section header (rejected — the line speaks for itself).
+    kick_reasons = data.get("kick_reasons") or []
+    if kick_reasons:
+        blocks.append("\n".join(str(r) for r in kick_reasons))
+
+    # Reply receipts (C11): plain lines, one per note she replied to since the
+    # last note. No section header — each line speaks for itself.
+    receipts = data.get("receipts") or []
+    if receipts:
+        blocks.append("\n".join(str(r) for r in receipts))
+
+    # ct-targeted outbox notes (covert session->cortex drops): each carries its
+    # own header, rendered as its own block.
+    ct_notes = data.get("ct_notes") or []
+    for cn in ct_notes:
+        if cn:
+            blocks.append(str(cn))
 
     pending = data.get("pending") or []
     if pending:
         segs = [f"due {p['hm']} {p['intent']}".rstrip() for p in pending]
         blocks.append("Pending self-schedule: " + " · ".join(segs))
 
-    replay = data.get("replay") or []
-    if data.get("replay_stale"):
-        blocks.append("No new messages since last wake.")
-    elif replay:
-        rlines = ["### Replay"]
-        for ev in replay:
-            role = ev.get("role", "")
-            content = " ".join((ev.get("content") or "").split())
-            rlines.append(f"[{ev['channel']} {ev['hm']}] {role}: {content}")
-        blocks.append("\n".join(rlines))
-
     note_text = "\n\n---\n\n".join(blocks)
     turn_end = _note_cfg(cfg).get("turn_end_text", "")
     if turn_end:
-        note_text += "\n\n" + turn_end
+        note_text += "\n\n" + turn_end.format_map(_ClampDefaults(config.wake_clamps(cfg)))
 
+    # Title and machine tag join the header block with a single newline (no
+    # blank line): the approved note opens with tag / "Now:" / "Active (Mac):"
+    # on three consecutive lines, in every shape.
     title = _note_cfg(cfg).get("title", "")
     if title:
-        note_text = title + "\n\n" + note_text
+        note_text = title + "\n" + note_text
+    # Fix 5: machine-origin tag as the very first line, so the model reads the
+    # ☀️ bell/wake-prompt turn that carried this note as an automated scheduler
+    # signal, not a user message. Config-driven ("" omits it); note copy only,
+    # never touches the bell text or receipt matching.
+    machine_tag = _note_cfg(cfg).get("wake_machine_tag", "")
+    if machine_tag:
+        note_text = machine_tag + "\n" + note_text
     return note_text
-
-
-def _render_budget(budget: dict | None) -> str | None:
-    """Plan Used line — shows utilization (USED %, statusline口径), pipe-joined:
-    `Plan Used: 5h 5% (04:50) | 7d 50% (1d2h) | Cortex Today 250k/1M 25% |
-    Net Session Token: 50k`. Net Session Token is window occupancy (statusline
-    total), not net spend — label kept for cross-system consistency with
-    marrow's threshold line. Any missing datum drops just its segment."""
-    if not budget:
-        return None
-    parts = []
-    five = budget.get("five_h_pct")
-    if five is not None:
-        seg = f"5h {five:.0f}%"
-        if budget.get("five_h_reset"):
-            seg += f" ({budget['five_h_reset']})"
-        parts.append(seg)
-    seven = budget.get("seven_d_pct")
-    if seven is not None:
-        seg = f"7d {seven:.0f}%"
-        if budget.get("seven_d_countdown"):
-            seg += f" ({budget['seven_d_countdown']})"
-        parts.append(seg)
-    daily = int(budget.get("daily_budget", 1_000_000))
-    today = int(budget.get("today_tokens", 0))
-    pct = (today / daily * 100) if daily else 0
-    parts.append(f"Cortex Today {today // 1000}k/{_fmt_budget(daily)} {pct:.0f}%")
-    window = budget.get("window_tokens")
-    if window is not None:
-        parts.append(f"Net Session Token: {window // 1000}k")
-    return "Plan Used: " + " | ".join(parts) if parts else None
-
-
-def _fmt_budget(n: int) -> str:
-    if n >= 1_000_000 and n % 1_000_000 == 0:
-        return f"{n // 1_000_000}M"
-    return f"{n // 1000}k"
-
-
-def _truncate(text: str, limit: int) -> str:
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[: max(limit - 1, 0)] + "…"
 
 
 if __name__ == "__main__":  # pragma: no cover - eyeball a real note

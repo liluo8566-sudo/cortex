@@ -2,7 +2,12 @@
 # Missing file / missing keys -> defaults below apply (tolerant load).
 
 [core]
-timezone = "Australia/Melbourne"
+# Empty/absent = follow the OS timezone. Set an IANA name only for
+# headless/VPS deploys where the OS tz differs from the user's.
+timezone = ""
+# Shell ids running as cortex shells (mirror of marrow [cortex].shells).
+# "cli" absent = this repo's heartbeat (wake daemon + watchdog) stays down.
+shells = ["cli"]
 
 [paths]
 # Empty = use the default paths listed in comments.
@@ -15,14 +20,19 @@ knowledgec_db = ""
 geofence_file = ""
 # Health export JSON (iOS Shortcut nightly dump). No default, must be set to enable.
 health_export = ""
-# Pacemaker affect-flag file (JSON dict written by A1/upset lane). Default: ~/.config/marrow/cortex/affect_flag.json
+# Affect-flag file (JSON dict written by A1/upset lane). Default: ~/.config/marrow/cortex/state/affect_flag.json
 affect_flag_file = ""
-# Pacemaker self-schedule queue (JSON list of {due_at}). Default: ~/.config/marrow/cortex/self_schedule.json
+# Self-schedule queue (JSON list of {due_at}). Default: ~/.config/marrow/cortex/state/self_schedule.json
 self_schedule_file = ""
-# Handoff note the next fresh window reads (assistant's handoff). Default: ~/.config/marrow/cortex/handoff.md
+# Handoff note the cli shell reads/writes (assistant's handoff; per-shell rolling
+# log, mirror of marrow [cortex].handoff_file_pattern).
+# Default: ~/.config/marrow/cortex/handoff-cli.md
 handoff_file = ""
 # Cortex session cwd (own CLAUDE.md lives here). Default: ~/.config/marrow/cortex
 cortex_home = ""
+# Non-cli shell ledgers (<dir>/<shell>.json) — mirror of marrow's
+# [cortex].shell_state_dir. Default: ~/.config/marrow/state/shells
+shell_state_dir = ""
 # Wishlist md, pure append-only, symlinked into NY. Default: <cortex_home>/wishlist.md
 wishlist_file = ""
 # NY db-pages dir wishlist.md gets symlinked into (daybrief.md is a real
@@ -32,90 +42,92 @@ ny_db_pages = ""
 # Default: ~/.config/marrow/logs/wake_timing.log
 wake_timing_log = ""
 # Wake-state audit trail (alarm epoch/generation events). Byte-shared with
-# marrow's [cortex].wake_audit_log_file. Default: <cortex_home>/wake_audit.log
+# marrow's [cortex].wake_audit_log_file. Default: <cortex_home>/state/wake_audit.log
 wake_audit_log = ""
-# Interactive-window (B3v) runtime files. Empty = defaults under cortex_home.
-wake_state_file = ""     # awake marker + resident iTerm session id. Default: <home>/wake_state.json
+# Interactive-window (B3v) runtime files. Empty = defaults under cortex_home/state/.
+wake_state_file = ""     # awake marker + resident iTerm session id. Default: <home>/state/wake_state.json
 wakeup_note_file = ""    # note text the window is told to Read. Default: <home>/wakeup_note.md
-watchdog_pidfile = ""    # per-wake watchdog pid. Default: <home>/watchdog.pid
+# Invisible free-round payload staged for the marrow hook (the window only sees
+# the short ⏳ marker). Match marrow [cortex].free_round_note_file.
+free_round_note_file = ""  # Default: <home>/free_round_note.md
+watchdog_pidfile = ""    # per-wake watchdog pid. Default: <home>/state/watchdog.pid
+spawn_lock_file = ""     # serializes every window-spawn entrant. Default: <home>/state/spawn.lock
 # Claude Code transcript dir for the window. Empty = derived from cortex_home
 # (munge non-alphanumeric -> '-'). Default: ~/.claude/projects/<munged cortex_home>
 transcript_dir = ""
 
-# marrow repo invocation for the wake call (separate venv/deps from cortex).
+# marrow repo invocation for subprocess helpers (separate venv/deps from cortex).
 [marrow]
-repo_dir = "~/CC-Lab/marrow"
 venv_python = "~/CC-Lab/marrow/.venv/bin/python"
-# Inner claude-call budget (seconds), passed down to marrow's cortex runner.
-# The outer subprocess kill is derived (this + a small margin), so the inner
-# timeout always fires first. Keep in sync with marrow [llm.claude_cli_cortex].
-call_timeout_s = 600
 
-# Per-wake safety valve. Cap the tokens one wake may spend; a mid-stream breach
-# (or the call_timeout_s wall clock above) terminates the session and rebirths a
-# fresh one on the next wake. 0 disables the token cap.
 [wake]
-token_cap = 150000
-# Wake delivery: "window" = resident interactive iTerm cli (B3v, default);
-# "headless" = the marrow-subprocess call (fallback, auto-used if osascript/iTerm
-# fails). The window body = one `claude` in cortex_home with MARROW_CORTEX=1
-# MARROW_CHANNEL=ct set explicitly.
-mode = "window"
+# Auto-adopt a cortex window you opened `claude` in yourself (in cortex_home) but
+# never registered: the reconcile pass records it as the resident (under the spawn
+# lock) instead of firing/spawning a duplicate window. Interactive-tty only, so a
+# headless `claude -p` run against the same cwd is never adopted. false = off.
+auto_adopt = true
+# Wake delivery is the resident interactive iTerm cli (B3v) and nothing else: a
+# window failure alerts and gives up the round. The window body = one `claude`
+# in cortex_home with MARROW_CORTEX=1 MARROW_CHANNEL=ct set explicitly.
 session_name = "cortex"        # iTerm session name for the resident window
 launch_command = "claude"      # command run in the window (env markers prepended)
-window_model = "opus"          # explicit --model for every cortex window; never
-                               # inherit the system default. Not a 1M-context variant.
+window_model = ""              # --model for cortex windows; "" = omit flag and
+                               # inherit the environment default
 window_effort = ""             # --effort (low|medium|high|xhigh|max); "" = omit flag
 skip_permissions = true        # add --dangerously-skip-permissions so a fresh dir's
                                # trust dialog never blocks the injected note
 ready_marker = "accept edits"  # TUI footer text signalling claude is ready for input
 ready_timeout_sec = 30         # max wait for readiness after a fresh spawn
-# The signal-file ear (alive-resident wake only). An already-running resident
-# window has a persistent Monitor (command: "tail -n 0 -f <signal_log>", persistent: true); the pacemaker
-# appends a WAKE line to wake it (no keyboard typing). ear_timeout_sec = how
-# long a wake is given to land (transcript grows) before the resident is
-# replaced by a FRESH window that gets the note as its first prompt.
-signal_log = ""                # Default: <cortex_home>/wake_signal.log
+# An already-running resident window is woken by TYPING the bell line into it.
+# ear_timeout_sec = how long that wake is given to land (transcript grows) before
+# the resident is replaced by a FRESH window that gets the note as its first
+# prompt.
 ear_timeout_sec = 90           # recovery deadline for an alive-window wake to land before respawn
-# A fresh window (rotate / dead resident / ear miss) is spawned with this as
+# A fresh window (rotate / dead resident / bell miss) is spawned with this as
 # claude's FIRST prompt — JUST an emoji, so nothing readable shows in the user's
 # face; the window wakes silently. The full wake instructions (read the note,
-# arm the ear, choose next wake) are injected by marrow's UserPromptSubmit hook
+# choose next wake) are injected by marrow's UserPromptSubmit hook
 # when this exact emoji is submitted in a cortex window.
 wake_prompt = "☀️"
-# Bell marker the marrow UserPromptSubmit hook detects to inject the full wakeup
-# note. The signal line is a BELL ONLY: "<marker> HH:MM" (local), no note body,
-# no read errand. rearm_suffix is appended when the ear died and the pacemaker
-# re-types the marker into an alive window (ladder 2a).
-wake_signal_marker = "[CORTEX-WAKE]"
-rearm_suffix = " (ear died — rearm)"
+# Visible wake lines = HUMAN TEXT ONLY (no machine marker, no epoch token). The
+# machine data (template/gen/state_id/rearm) is written to the wake_state receipt
+# sidecar at send time; the marrow hook exact-matches the on-screen line against
+# it. {hm} = local HH:MM; a fully STATIC template with no {hm} is also valid.
+# Must match marrow [cortex].spawn_opener_template / [cortex].wake_bell_template.
+#   spawn_opener_template = first prompt baked into a FRESHLY SPAWNED window
+#     (also the window-lineage marker used to find resumable sessions).
+#   wake_bell_template = line TYPED into an already-running resident window.
+spawn_opener_template = "[☀️ {hm}]"
+wake_bell_template = "⏰ {hm}"
+# Pending-receipt time-to-live (minutes): the consumer ignores an older receipt
+# and the producer overwrites it on each new bell. Match marrow receipt_ttl_min.
+receipt_ttl_min = 15
 # say() = the ONLY place cortex takes focus: it fronts the resident window and
 # plays a system sound (name of a /System/Library/Sounds/*.aiff; "" = silent).
 say_sound = "Glass"
-wait_max_per_wake = 0       # max wait() calls per wake (0 = uncapped; night gate / 150k fuse / grace / user return backstop)
-wait_min = 16               # wait(N) clamp lower bound (minutes) — floor > silence gate (15) keeps wait "post-gate renewal"
-wait_max = 55               # wait(N) clamp upper bound (minutes) — hot cache-TTL guard
-next_wake_min = 90          # lie_down(next_wake_min=N) clamp lower bound (minutes)
-next_wake_rotate_min = 16   # rotate short-sleep clamp lower bound ("context full, back in N min")
-next_wake_max = 360         # lie_down(next_wake_min=N) clamp upper bound (minutes)
-sentinel = true             # arm cortex.sentinel (one-shot exact-time wake) at every lie_down; false = tick-only fallback
-# Free-round marker appended to wake_signal.log at the silence gate or a wait(N)-
-# expiry. {mins} = real minutes since the user's last message; {user} = marrow
-# user_name (fallback "the user"). No-user tier gets no marker.
-tuck_in_text = "⏳ [NEW ROUND] {mins} min since {user}'s last message. Choose again: 1) play around (playbook); 2) wait(N) (16-55min); 3) lie_down(next_wake_min=N) (90-360min). Feel free to do anything. No need to wait for reply - {user} will wake you the moment she's back."
+next_wake_max = 360         # lie_down(next_wake_min=N) clamp upper bound (minutes); floor is 0 (immediate re-wake) at every hour
+# Free-round line typed into the window at every silence-cycle injection
+# (last line of the block, after the freshly rendered note). MUST contain the
+# "[NEW ROUND]" machine-line marker — without it the line resets the silence
+# timer it just armed (perpetual loop). {mins}/{user} optional.
+tuck_in_text = "⏳ [NEW ROUND]"
 # Markers identifying a NON-user turn (so they don't reset the silence timer and
-# downstream memory drops them). wake_signal_marker is added automatically.
-# Substring match: "[CMD" catches every ⚙️ [CMD ct-*] slash-command body.
-machine_line_markers = ["[TUCK-IN]", "[NEW ROUND]", "[NIGHT]", "[FUSE]", "[CTL]", "[CMD"]
-wait_expiry_note = true      # every free-round tuck-in (silence-gate or wait(N)-expiry) appends a freshly rendered wakeup note (diff mode: only events since the last rendered note this wake)
+# downstream memory drops them). Both wake-line prefixes (spawn_opener_template,
+# wake_bell_template) are added automatically. Substring match: "[CMD" catches
+# every ⚙️ [CMD ct-*] slash-command body.
+machine_line_markers = ["[NEW ROUND]", "[FUSE]", "[CTL]", "[CMD"]
+free_round_note = true       # every free-round injection appends a freshly rendered wakeup note above the marker line (diff mode: only events since the last rendered note this wake)
+# Covert-delivery markers typed into the window. Only the marker reaches the screen; the body is
+# injected invisibly by the marrow hook (fuse -> [cortex].fuse_prompt_text; ctl ->
+# [cortex].ctl_sleep_text from the mins/rotate args).
+fuse_marker = "⚙️ [FUSE]"
+ctl_sleep_marker = "⚙️ [CTL]"
 
 # Per-wake watchdog thresholds (spawned at injection, killed at lie_down).
 [wake.watchdog]
 poll_sec = 60
-silent_max_min = 15            # chat tier: user replied this wake -> at this silence, append free-round marker (no live wait_until)
-no_user_gate_min = 5           # no-user tier: no user reply this wake -> at this silence, proxy lie_down(auto) directly, no marker
-tuck_grace_min = 5             # after TUCK-IN, no wait/lie_down within this -> proxy lie_down(auto)
-fuse_tokens = 150000           # (c) window tokens >= this -> esc + proxy lie_down (fuse)
+silent_max_min = 20            # silence cycle (same bar for chat or no-user wake): at this silence, inject one free-round note + marker, then re-arm the same timer
+fuse_tokens = 180000           # window tokens >= this -> esc + proxy lie_down (fuse); marrow's soft nudge (usage.show_tokens, 160k) fires first
 # Process-level hard interrupt (SIGINT), a guaranteed esc-equivalent for when the
 # osascript esc may not land (no window focus). Fires after esc on the fuse
 # path, only if the transcript is still growing past the grace window.
@@ -125,7 +137,9 @@ hard_interrupt_grace_sec = 30
 # lie_down(rotate=True). It gets this many seconds to do so itself before the
 # force path (SIGINT + proxy lie_down) fires. Hard deadline — the fuse never hangs.
 fuse_handoff_grace_sec = 300
-# fuse_handoff_prompt = ""     # override the "write handoff + lie_down" prompt text
+# FUSE prompt body now lives marrow-side ([cortex].fuse_prompt_text) — cortex writes only the
+# ⚙️ [FUSE] marker; the marrow hook injects the body covertly. The old cortex-side
+# fuse_handoff_prompt override is retired.
 
 # Context-window rotation: lie_down (and the tick fallback) flag a rotate when the
 # window grows past this, so the NEXT wake respawns a fresh window (SIGTERM claude
@@ -138,6 +152,10 @@ cooldown_sec = 600
 # this long -> presume the watchdog died, proxy lie_down (force_slept=stale).
 [wake.stale]
 threshold_min = 15
+# A single dead-window verdict can be a transient osascript hiccup (the window
+# was actually alive). Require this many CONSECUTIVE dead verdicts (same
+# snapshot gen, within the suspect TTL) before reaping. 1 = old immediate reap.
+confirm_ticks = 2
 
 [knowledgec]
 # knowledgeC.db ZSTREAMNAME to read app-usage rows from.
@@ -156,56 +174,62 @@ enabled = false
 # launchd tick cadence (seconds). Baked into the plists at `python -m cortex.install`.
 [tick]
 collect_interval_sec = 1800    # collectors ~30min
-pacemaker_interval_sec = 300   # pacemaker evaluation ~5min
 usage_snapshot = true          # OAuth usage % snapshot (marrow subprocess) each tick
 
-# Integration layer knobs (numbers the integration computes and hands the pure pacemaker).
+# Reconcile knob: gates whether a fired ledger wake actually spawns (reconcile.py
+# _fire_dead_window) or just redraws the floor, log-only.
 [pacemaker]
 dry_run = true                 # log-only; flip to false only once outbound (C5) lands
-active_window_min = 5          # activity within this many min => she is in a live session
-at_home_default = true         # until geofence-derived location is wired in
-cal_busy_default = false       # until calendar busy state is wired in
-
-[gates]
-# Night window: zero self-wakes 23-06 (floor/self_scheduled/affect_flag all
-# silent). cap = 0 = no self-wake at night.
-[gates.night]
-start = "23:00"
-end = "06:00"
-cap = 0
-# Wrap-up instruction injected once (after the current turn) into a still-awake
-# resident window when the night window opens: it writes its handoff and lies
-# down. Once down, the session is marked non-resumable so the first post-night
-# wake is a plain fresh spawn that reads the handoff via SessionStart.
-close_prompt = "⏳ [NIGHT] Night window is open — one full sleep now. Write your handoff entry, then lie_down to end this wake."
-# Daily wake-token budget: once today's SUM(NET spend — cache-miss rewrite +
-# output, ct_wake_log.net_tokens with a tokens fallback) reaches tokens,
-# self-wakes stop; resets naturally at local midnight.
-# Net semantics — cache reads are near-free, net is the real cost.
-[gates.daily_budget]
-tokens = 1000000
 
 [triggers]
-# Wake-window (minutes) from lie-down. lie_down picks the next wake: an explicit
-# minutes choice (clamped to [min, max]) or a uniform "dice" draw when omitted.
-# max = cache-TTL guard (also caps a model-declared cortex.wait); min = anti-thrash.
-floor_min_min = 10             # wake-window draw lower bound (uniform lo / clamp min)
-floor_max_min = 55             # wake-window draw upper bound (uniform hi / clamp max)
+# Wake-window interval (minutes) from lie-down. lie_down picks the next wake:
+# an explicit minutes choice, or this fixed interval when omitted.
+floor_min = 55                 # fixed wake-window interval (minutes)
+
+# External-wake (cortex.kick) reason lines rendered as plain lines in the wakeup
+# note (no section header), then cleared on delivery. A bridge/cli poke appends
+# one; note.py renders + consumes it. {id} = outbox note id; {text} = her reply
+# body (bridge-truncated); {minutes} = channel silence minutes.
+[kick]
+reason_reply = 'Msg #{id} replied: "{text}"'
+reason_timeout = "Msg #{id} no reply in {minutes}min"
+reason_morning = "She's up — day mode"
+reason_note = "New note #{id}"  # F9: ct note dropped -> immediate carrier round
+max_reasons = 8                # cap the pending-flag list (stuck bridge guard)
 
 # Wakeup note knobs. Every line is deterministic now, so the old whole-note
 # max_chars cap is gone; per-source limits below keep each line bounded.
 # Persona/display strings + behaviour (identity stays in config).
 [note]
+# Machine-origin tag prepended as the FIRST line of every wakeup note (before
+# title). Makes the model treat the ☀️ bell/wake-prompt turn that delivered this
+# note as an automated scheduler signal, not a message the user typed. Note copy
+# only — does not change the bell text or receipt matching. "" omits it.
+wake_machine_tag = "[AUTOMATED WAKE SIGNAL — Note delivered by the scheduler]"
 title = ""                   # first line of the wakeup note, e.g. a nickname for the note; empty hides it
-replay_events = 6            # trailing user/assistant events in the replay section
-replay_event_chars = 300     # per-event truncation in the replay section
-replay_exclude_channels = ["ct"]  # channels excluded from replay (ct = cortex self-talk); [] to include all
-daily_budget = 1000000       # daily wake-token (NET spend) budget the "today X/Y" line renders against; must match gates.daily_budget.tokens
 pending_window_min = 15      # surface a self-schedule entry only when due within this window
 handoff_title = "碎碎念"   # title of the handoff-note section (customisable display name)
-replay_title = "最近对话回放"     # title of the conversation-replay section
 handoff_wake_kinds = ["rotate"]  # wake kinds that get the handoff (fresh window only)
 cadence_bin = ""             # cadence CLI for cal/rem lines; empty = packaged default path
-turn_end_text = "NOTE: Call MCP tool to wait or lie_down at the end of each turn. Wait=wait(N) [N=16-55]; sleep=lie_down(next_wake_min=N) [90-360; rotate=True unlocks ≥16]. Skip call = sleep in 5 mins. Auto timer is on during active chat - no call needed."  # one-line reminder appended at the end of every rendered note; "" omits it
+turn_end_text = ""           # one-line reminder appended at the end of every rendered note; "" omits it (the silence cycle already carries this). {next_wake_min}/{next_wake_max}/{silent_max_min} render from the wake clamps
+receipt_line = 'Note #{id} ({channel} {sent_hm}): she replied {replied_hm} "{text}"'  # reply-receipt line (C11); one per note she replied to since last note. {id}/{channel}/{sent_hm}/{replied_hm}/{text} from the outbox row; "" omits receipts
 # Header written into a freshly-created wishlist.md (append-only; never overwritten). Display text — customise freely.
 wishlist_header = "# Wishlist\n\n(owed treats / wants / self-rewards — append-only)\n"
+
+# Cross-channel note delivery into the cortex window.
+[outbox]
+inject_header = "📮 Message from {channel}·{sid4} {time}"  # header for a ct-targeted outbox note rendered by the wakeup note; mirror of marrow [outbox].inject_header (keep in sync). {channel}/{sid4}/{time} from the outbox row; "" = body only
+
+# cortex.daemon — the always-on cli timing loop (scheduler-hosted; replaces the
+# launchd pacemaker cron). Two deadlines: "<shell>.reconcile" on a fixed cadence
+# and "<shell>" for business (next_wake_at ledger / silence free-round). lie_down
+# kicks "<shell>" over the socket so a new alarm is picked up instantly.
+[daemon]
+enabled = true
+shell = "cli"                  # scheduler shell key; reconcile key = "<shell>.reconcile"
+socket_path = ""               # kick socket; "" -> <cortex_home>/state/cortex-daemon.sock (must stay under 104 bytes — AF_UNIX limit)
+kick_timeout_sec = 1.0         # lie_down -> daemon kick connect/send timeout
+reconcile_interval_sec = 60    # reconcile cadence (also the scheduler's max sleep)
+safety_horizon_sec = 300       # business re-arm gap when nothing is pending
+retry_interval_sec = 60        # business re-arm gap after a held/failed fire (anti-spin)
+lock_path = ""                 # singleton lock; "" -> <cortex_home>/state/daemon.lock

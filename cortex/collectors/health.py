@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, tzinfo
 
 from cortex import db
-from cortex.config import health_export_path
+from cortex.config import health_export_path, get_tz
 
 
 def _flatten(prefix: str, value, out: dict[str, str]) -> None:
@@ -26,7 +25,7 @@ def _flatten(prefix: str, value, out: dict[str, str]) -> None:
         out[prefix] = json.dumps(value) if not isinstance(value, str) else value
 
 
-def _export_date(payload: dict, path, tz: ZoneInfo) -> str:
+def _export_date(payload: dict, path, tz: tzinfo) -> str:
     for date_key in ("date", "export_date", "day"):
         if isinstance(payload.get(date_key), str):
             return payload[date_key][:10]
@@ -44,7 +43,7 @@ def collect(conn: sqlite3.Connection, cfg: dict) -> None:
     if not path.exists():
         raise FileNotFoundError(f"health export not found at {path}")
 
-    tz = ZoneInfo(cfg["core"].get("timezone", "Australia/Melbourne"))
+    tz = get_tz(cfg)
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
 

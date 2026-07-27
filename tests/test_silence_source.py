@@ -71,17 +71,39 @@ def test_free_round_injection_does_not_reset(cfg):
     assert 19.0 < transcript.user_silent_min(cfg) < 21.0
 
 
-def test_wake_bell_and_night_lines_do_not_reset(cfg):
+def test_wake_bell_line_does_not_reset(cfg):
+    # Shipped default RESIDENT bell prefix ('⏰ {hm}' -> '⏰').
     _write(cfg, [
         _user("q", 25),
-        _user("[CORTEX-WAKE] 14:03", 2),
-        _user("⏳ [NIGHT] Night window is open ...", 1),
+        _user("⏰ 14:03", 2),
     ])
     assert 24.0 < transcript.user_silent_min(cfg) < 26.0
 
 
-def test_tuck_in_marker_line_does_not_reset(cfg):
-    _write(cfg, [_user("q", 18), _user("⏳ [TUCK-IN] legacy marker", 1)])
+def test_spawn_opener_line_does_not_reset(cfg):
+    # The fresh-spawn opener is a SECOND machine shape ('☀️ {hm}' -> '☀️'); both
+    # prefixes feed _line_markers, so neither counts as user speech.
+    _write(cfg, [
+        _user("q", 25),
+        _user("☀️ 14:03", 2),
+    ])
+    assert 24.0 < transcript.user_silent_min(cfg) < 26.0
+
+
+def test_wake_bell_zwj_static_template_does_not_reset(cfg):
+    # Static (no {hm}) multi-codepoint ZWJ bell template must also self-match
+    # as a machine line (regression: emoji-leading marker previously never
+    # matched itself once the leading-decoration strip consumed it).
+    cfg["wake"]["wake_bell_template"] = "[🧚‍♀️ 笨鸭换岗成功]"
+    _write(cfg, [
+        _user("q", 25),
+        _user("[🧚‍♀️ 笨鸭换岗成功]", 2),
+    ])
+    assert 24.0 < transcript.user_silent_min(cfg) < 26.0
+
+
+def test_free_round_marker_line_does_not_reset(cfg):
+    _write(cfg, [_user("q", 18), _user("⏳ [NEW ROUND] free-round line", 1)])
     assert 17.0 < transcript.user_silent_min(cfg) < 19.0
 
 
