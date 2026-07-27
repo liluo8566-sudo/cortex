@@ -57,9 +57,9 @@ def cmd_wake(cfg: dict) -> str:
                     "explanation": f"{now.strftime('%H:%M')} manual ctl wake"}
         result = run_wake(conn, cfg, decision, now=now)
         if result.get("mode") != "window":
-            next_floor = occupancy.lie_down(conn, cfg)
+            next_at = occupancy.lie_down(conn, cfg)
             wake_state.set_next_wake_at(
-                cfg, next_floor.isoformat() if next_floor else None)
+                cfg, next_at.isoformat() if next_at else None)
         rotated = "fresh" if wake_state.load(cfg).get("rotated") else "resume/spawn"
         return f"{prefix}wake: {rotated} (mode={result.get('mode')})"
     finally:
@@ -142,12 +142,13 @@ def cmd_pause(cfg: dict, shell: str | None = None) -> str:
     # tg and writes an alert row (see breaker.trip_message / watchdog._fuse).
     extra = ""
     # Put the live cli window down through the SAME proxy path the watchdog fuse
-    # uses (lie_down -> clears awake, kills the watchdog, redraws the floor).
-    # The alarm it books cannot fire while the breaker stands.
+    # uses (lie_down -> clears awake, kills the watchdog). book_alarm=False: a
+    # pause is a pure stop, it books NO next wake — only a manual ct-wake
+    # resumes, and that fires a round immediately.
     if scope in (breaker.SCOPE_ALL, "cli") and wake_state.load(cfg).get("awake"):
         from cortex import lie_down as lie_down_mod
         try:
-            lie_down_mod.lie_down(cfg, force_slept="ct-pause")
+            lie_down_mod.lie_down(cfg, force_slept="ct-pause", book_alarm=False)
             extra = "; live cli window put down"
         except Exception as e:  # noqa: BLE001 — the breaker stands regardless
             extra = f"; live cli window still up ({e})"

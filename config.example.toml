@@ -105,7 +105,12 @@ receipt_ttl_min = 15
 # say() = the ONLY place cortex takes focus: it fronts the resident window and
 # plays a system sound (name of a /System/Library/Sounds/*.aiff; "" = silent).
 say_sound = "Glass"
-next_wake_max = 360         # lie_down(next_wake_min=N) clamp upper bound (minutes); floor is 0 (immediate re-wake) at every hour
+next_wake_max = 360         # lie_down(next_wake_min=N) clamp upper bound (minutes); lower bound is 0 (immediate re-wake) at every hour
+# Minutes until the next wake when no caller picked one (proxy lie_down, daemon/
+# ctl/reconcile re-arm after a failed round). Cross-repo interval contract: keep
+# equal to [wake.watchdog].silent_max_min and synapse tg [cortex].shell_idle_min.
+default_sleep_min = 20
+lock_alert_throttle_min = 60 # max one wake_state lock give-up alert per this many minutes
 # Free-round line typed into the window at every silence-cycle injection
 # (last line of the block, after the freshly rendered note). MUST contain the
 # "[NEW ROUND]" machine-line marker — without it the line resets the silence
@@ -141,13 +146,6 @@ fuse_handoff_grace_sec = 300
 # ⚙️ [FUSE] marker; the marrow hook injects the body covertly. The old cortex-side
 # fuse_handoff_prompt override is retired.
 
-# Context-window rotation: lie_down (and the tick fallback) flag a rotate when the
-# window grows past this, so the NEXT wake respawns a fresh window (SIGTERM claude
-# + fresh spawn — no /clear typing). Cooldown guards the tick fallback from repeats.
-[wake.rotate]
-threshold_tokens = 100000
-cooldown_sec = 600
-
 # Stale-wake guard: tick sees the awake marker but the transcript has been idle
 # this long -> presume the watchdog died, proxy lie_down (force_slept=stale).
 [wake.stale]
@@ -176,15 +174,11 @@ enabled = false
 collect_interval_sec = 1800    # collectors ~30min
 usage_snapshot = true          # OAuth usage % snapshot (marrow subprocess) each tick
 
-# Reconcile knob: gates whether a fired ledger wake actually spawns (reconcile.py
-# _fire_dead_window) or just redraws the floor, log-only.
+# Wake brake: gates whether a fired ledger wake actually spawns a window or is
+# log-only (still re-arming the next wake). Covers both fire paths — the daemon
+# business deadline and the reconcile dead-window fire.
 [pacemaker]
 dry_run = true                 # log-only; flip to false only once outbound (C5) lands
-
-[triggers]
-# Wake-window interval (minutes) from lie-down. lie_down picks the next wake:
-# an explicit minutes choice, or this fixed interval when omitted.
-floor_min = 55                 # fixed wake-window interval (minutes)
 
 # External-wake (cortex.kick) reason lines rendered as plain lines in the wakeup
 # note (no section header), then cleared on delivery. A bridge/cli poke appends
@@ -208,6 +202,7 @@ max_reasons = 8                # cap the pending-flag list (stuck bridge guard)
 wake_machine_tag = "[AUTOMATED WAKE SIGNAL — Note delivered by the scheduler]"
 title = ""                   # first line of the wakeup note, e.g. a nickname for the note; empty hides it
 pending_window_min = 15      # surface a self-schedule entry only when due within this window
+pause_tag = "(paused: {reason})"  # appended to the "Now: … | Last active: …" line while the circuit breaker covers THIS shell. {reason} = manual/auto_fuse, {scope} = all/cli/tg; "" omits the tag
 handoff_title = "碎碎念"   # title of the handoff-note section (customisable display name)
 handoff_wake_kinds = ["rotate"]  # wake kinds that get the handoff (fresh window only)
 cadence_bin = ""             # cadence CLI for cal/rem lines; empty = packaged default path

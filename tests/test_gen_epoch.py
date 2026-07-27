@@ -98,27 +98,27 @@ def test_conditional_mutate_drops_stale(cfg):
 # ── BUG A: user message during a still-running lie_down cancels the new alarm ──
 
 def test_bug_a_user_reset_right_after_claim_suppresses_all(cfg, monkeypatch):
-    """lie_down paused right after the claim (gen bumped), before the floor
-    redraw; a user reset fires on the same state; on release EVERY late side
-    effect is suppressed: no floor redraw, watchdog NOT killed, rotate suppressed,
+    """lie_down paused right after the claim (gen bumped), before the next
+    wake is booked; a user reset fires on the same state; on release EVERY late side
+    effect is suppressed: no next-wake booking, watchdog NOT killed, rotate suppressed,
     no ledger."""
     _seed_awake(cfg, transcript="/t/old.jsonl")
 
     released = threading.Event()
     reached = threading.Event()
 
-    # Seam: block inside occupancy.lie_down (floor redraw) — the first late
+    # Seam: block inside occupancy.lie_down (next-wake booking) — the first late
     # action, right after the claim. Actually pause BEFORE it via _token_ok so the
     # whole tail sees the stale token.
     from cortex import occupancy
-    real_floor = occupancy.lie_down
+    real_lie_down = occupancy.lie_down
 
-    def paused_floor(conn, cfg_, **kw):
+    def paused_lie_down(conn, cfg_, **kw):
         reached.set()
         released.wait(2.0)
-        return real_floor(conn, cfg_, **kw)
+        return real_lie_down(conn, cfg_, **kw)
 
-    monkeypatch.setattr("cortex.occupancy.lie_down", paused_floor)
+    monkeypatch.setattr("cortex.occupancy.lie_down", paused_lie_down)
     kicked = []
     monkeypatch.setattr("cortex.lie_down._notify_daemon",
                         lambda cfg_: kicked.append(1))

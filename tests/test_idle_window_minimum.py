@@ -181,9 +181,10 @@ def test_interrupted_delivery_is_still_consumed(awake, monkeypatch):
 
 
 def test_alarm_is_consumed_before_the_wake_is_delivered(cfg, monkeypatch):
-    """A due alarm is cleared the moment the fire is decided — a delivery that
-    is interrupted (or raises) must not leave a still-due alarm for the next
-    deadline to re-fire seconds later."""
+    """A due alarm is cleared the moment the fire is decided, so an interrupted
+    delivery cannot re-fire on the next deadline. A raising delivery then lands
+    on the re-arm path (a fresh alarm, not the old due one) instead of losing
+    the alarm entirely."""
     import cortex.wake as wake_mod
     seen = {}
 
@@ -191,15 +192,16 @@ def test_alarm_is_consumed_before_the_wake_is_delivered(cfg, monkeypatch):
         seen["ledger_at_delivery"] = wake_state.get_next_wake_at(c)
         raise RuntimeError("esc: delivery interrupted")
 
+    cfg["pacemaker"]["dry_run"] = False
     monkeypatch.setattr(wake_mod, "run_wake", fake_run_wake)
     tz = config.get_tz(cfg)
     wake_state.set_next_wake_at(cfg, (datetime.now(tz)
                                       - timedelta(minutes=1)).isoformat())
     d = daemon.WakeDaemon(cfg, scheduler=FakeScheduler(), clock=time.time)
-    with pytest.raises(RuntimeError):
-        d.business_once()
+    d.business_once()
     assert seen["ledger_at_delivery"] is None       # cleared BEFORE delivery
-    assert wake_state.get_next_wake_at(cfg) is None  # no re-fire next deadline
+    rearmed = datetime.fromisoformat(wake_state.get_next_wake_at(cfg))
+    assert rearmed > datetime.now(tz)               # future, so no re-fire now
 
 
 # --- 4. overdue at startup re-arms, never delivers -------------------------

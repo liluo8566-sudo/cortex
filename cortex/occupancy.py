@@ -2,9 +2,9 @@
 "Cortex Today" token accounting.
 
 Sole owner of the single-row JSON state (id=1): the persisted WakeState
-dataclass, the side-channel window_tokens occupancy, the floor redraw written
-at lie-down, and the activation wake-log row. No decision logic lives here —
-callers (lie_down, wake, watchdog, note, ctl) read/write through these APIs.
+dataclass, the side-channel window_tokens occupancy, the lie-down timestamp,
+and the activation wake-log row. No decision logic lives here — callers
+(lie_down, wake, watchdog, note, ctl) read/write through these APIs.
 """
 from __future__ import annotations
 
@@ -20,9 +20,8 @@ from cortex import config as _config, db
 
 @dataclass(frozen=True)
 class PacemakerState:
-    next_floor_due_at: datetime | None = None
     last_wake_at: datetime | None = None
-    # C-wm timing: lie-down = wake finished; floor clock redraws from here.
+    # C-wm timing: lie-down = wake finished; the next wake is scheduled from here.
     last_lie_down_at: datetime | None = None
     # Cortex session resume (C3). Only the wake caller (cortex.wake)
     # reads/writes this.
@@ -69,16 +68,11 @@ def parse_due_at(value: str | None, tz: tzinfo) -> datetime | None:
 
 def _state_to_json(state: PacemakerState, base: dict | None = None) -> str:
     obj = dict(base or {})  # preserve side-channel keys (window_tokens)
-    # Drop any legacy desire/expect_reply/cortex_session_date/night_cap_key/
-    # night_wake_count keys carried in from an old row (cortex_session_date:
-    # rebirth retired, 3155246; night_* : night package retired, T3).
-    obj.pop("desire", None)
-    obj.pop("expect_reply", None)
-    obj.pop("cortex_session_date", None)
-    obj.pop("night_cap_key", None)
-    obj.pop("night_wake_count", None)
+    # Drop legacy keys carried in from an old row (retired engines).
+    for dead in ("desire", "expect_reply", "cortex_session_date",
+                 "night_cap_key", "night_wake_count", "next_floor_due_at"):
+        obj.pop(dead, None)
     obj.update({
-        "next_floor_due_at": _iso(state.next_floor_due_at),
         "last_wake_at": _iso(state.last_wake_at),
         "last_lie_down_at": _iso(state.last_lie_down_at),
         "cortex_session_id": state.cortex_session_id,
@@ -87,12 +81,9 @@ def _state_to_json(state: PacemakerState, base: dict | None = None) -> str:
 
 
 def _state_from_json(text: str) -> PacemakerState:
-    # Tolerant load: legacy rows may still carry desire/expect_reply/
-    # cortex_session_date/night_cap_key/night_wake_count keys — they are simply
-    # ignored (retired engines).
+    # Tolerant load: legacy keys from retired engines are simply ignored.
     o = json.loads(text)
     return PacemakerState(
-        next_floor_due_at=_parse_dt(o.get("next_floor_due_at")),
         last_wake_at=_parse_dt(o.get("last_wake_at")),
         last_lie_down_at=_parse_dt(o.get("last_lie_down_at")),
         cortex_session_id=o.get("cortex_session_id"),
@@ -142,22 +133,6 @@ def window_tokens_hint(conn: sqlite3.Connection) -> int:
         return int(val) if val is not None else 0
     except (TypeError, ValueError):
         return 0
-
-
-def clear_floor_deadline(conn: sqlite3.Connection) -> bool:
-    """Drop the floor hold (next_floor_due_at = None) so the floor trigger reads
-    DUE on the next reconcile. Merged into the raw JSON so no other key is
-    touched. False when there is no row / nothing to clear."""
-    obj = _raw_state(conn)
-    if not obj or obj.get("next_floor_due_at") is None:
-        return False
-    obj["next_floor_due_at"] = None
-    conn.execute(
-        "UPDATE ct_pacemaker_state SET state = ?, updated_at = ? WHERE id = 1",
-        (json.dumps(obj), db.utcnow_iso()),
-    )
-    conn.commit()
-    return True
 
 
 def save_state(conn: sqlite3.Connection, state: PacemakerState) -> None:
@@ -221,7 +196,7 @@ def _finished_window_finals(conn: sqlite3.Connection, now: datetime) -> int:
 
 
 # --------------------------------------------------------------------------
-# wake log + floor redraw
+# wake log + next-wake scheduling
 # --------------------------------------------------------------------------
 
 def log_activation_wake_row(conn: sqlite3.Connection, now: datetime,
@@ -246,35 +221,27 @@ def log_activation_wake_row(conn: sqlite3.Connection, now: datetime,
         return None
 
 
-def reschedule_floor(now: datetime, config: dict,
-                     minutes: float | None = None) -> datetime:
-    """Draw the next wake due time from `now`. `minutes` = an explicit choice
-    (already clamped by the caller); None = the fixed [triggers].floor_min
-    interval. Callers pass lie-down time as `now` on the wake path (C-wm: the
-    clock runs from lie-down, not wake); gated firings redraw from tick time
-    so a blocked floor doesn't re-fire every tick."""
-    trig_config = config.get("triggers", {})
-    draw = trig_config.get("floor_min", 55) if minutes is None else minutes
-    return now + timedelta(minutes=draw)
+def schedule_next_wake(now: datetime, config: dict,
+                       minutes: float | None = None) -> datetime:
+    """The next wake due time from `now`. `minutes` = an explicit choice
+    (already clamped by the caller); None = [wake].default_sleep_min. Callers
+    pass lie-down time as `now` on the wake path (C-wm: the clock runs from
+    lie-down, not wake)."""
+    if minutes is None:
+        minutes = config.get("wake", {}).get("default_sleep_min", 20)
+    return now + timedelta(minutes=minutes)
 
 
 def lie_down(conn: sqlite3.Connection, cfg: dict, now: datetime | None = None,
              minutes: float | None = None) -> datetime:
-    """Mark wake end (C-wm): lie_down chooses the next internal wake. `minutes`
-    = an explicit choice (pre-clamped by the caller to [1, next_wake_max] via
-    clamp_next_wake_minutes, not re-clamped here); None = the fixed
-    [triggers].floor_min interval (preserves prior behaviour). The clock
-    restarts from lie-down. Called when a wake finishes — including on wake
-    failure, so a crashed wake can't wedge it.
-    Returns the redrawn next-floor datetime (local tz)."""
+    """Mark wake end (C-wm) and pick the next internal wake. `minutes` = an
+    explicit choice (pre-clamped by the caller to [0, next_wake_max] via
+    clamp_next_wake_minutes, not re-clamped here); None = [wake].default_sleep_min.
+    The clock restarts from lie-down. Called when a wake finishes — including on
+    wake failure, so a crashed wake can't wedge it.
+    Returns the next-wake datetime (local tz)."""
     now = now or _now(cfg)
 
-    next_floor = reschedule_floor(now, cfg, minutes)
-    state = load_state(conn)
-    new_state = dataclasses.replace(
-        state,
-        next_floor_due_at=next_floor,
-        last_lie_down_at=now,
-    )
-    save_state(conn, new_state)
-    return next_floor
+    next_at = schedule_next_wake(now, cfg, minutes)
+    save_state(conn, dataclasses.replace(load_state(conn), last_lie_down_at=now))
+    return next_at

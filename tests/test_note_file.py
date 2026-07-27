@@ -40,6 +40,34 @@ def test_rewrite_keeps_order_and_other_shells_sid(tmp_path):
         "## cli · sid=eeeeeeee\ncli-2\n\n## tg · sid=cccccccc\ntg-1\n")
 
 
+def test_sids_are_all_or_nothing(tmp_path):
+    """One shell without a sid strips the label off EVERY heading — never one
+    section attributed and its neighbour bare."""
+    p = _p(tmp_path)
+    note_file.write_section(p, "cli", "cli-body", "aaaaaaaabbbb")
+    note_file.write_section(p, "tg", "tg-body", None)
+    assert p.read_text() == "## cli\ncli-body\n\n## tg\ntg-body\n"
+    # Self-heal: sid_for re-resolves the other sections live, so once tg has a
+    # sid the whole file is labelled again (the stripped file is not a ratchet).
+    note_file.write_section(p, "tg", "tg-body", "ccccccccdddd",
+                            sid_for={"cli": "aaaaaaaabbbb"}.get)
+    assert p.read_text() == (
+        "## cli · sid=aaaaaaaa\ncli-body\n\n## tg · sid=cccccccc\ntg-body\n")
+
+
+def test_sid_for_failure_falls_back_to_the_file(tmp_path):
+    """A resolver that raises/returns nothing leaves the recorded sid in place."""
+    p = _p(tmp_path)
+    note_file.write_section(p, "cli", "cli-body", "aaaaaaaabbbb")
+
+    def boom(_shell):
+        raise RuntimeError("resolver down")
+
+    note_file.write_section(p, "tg", "tg-body", "ccccccccdddd", sid_for=boom)
+    assert p.read_text() == (
+        "## cli · sid=aaaaaaaa\ncli-body\n\n## tg · sid=cccccccc\ntg-body\n")
+
+
 def test_legacy_headless_blob_is_dropped(tmp_path):
     """A pre-section single-blob file belongs to no shell — it must not survive
     as an unattributed lump at the top."""

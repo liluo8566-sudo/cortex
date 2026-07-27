@@ -142,25 +142,30 @@ def _fire_dead_window(conn, cfg: dict, why: str) -> str:
     """A dead resident window whose ledger is due (or an accidental close) needs
     firing NOW. Reuse the tested wake path: run_wake's _window_wake_plan reads the
     rotate flag itself — rotated -> fresh spawn (handoff), else -> resume the
-    recorded session. dry_run short-circuits to a log-only floor redraw.
+    recorded session. dry_run short-circuits to a log-only re-arm.
 
     Every branch here handled the due ledger entry -> it must be consumed
-    (cleared or replaced with the freshly redrawn floor), else the stale
+    (cleared or replaced with the freshly booked next wake), else the stale
     next_wake_at stays due and reconcile re-fires it again every cadence."""
     from cortex.wake import run_wake
     now = occupancy._now(cfg)
     if bool(cfg["pacemaker"].get("dry_run", True)):
-        next_floor = occupancy.lie_down(conn, cfg)
-        wake_state.set_next_wake_at(cfg, next_floor.isoformat() if next_floor else None)
-        return f"reconcile ({why}) -> dry_run, floor redrawn only"
+        _rearm_next_wake(conn, cfg)
+        return f"reconcile ({why}) -> dry_run, next wake re-armed only"
     decision = {"wake": True, "reasons": [], "gated_by": [],
                 "wake_reasons": "reconcile",
                 "explanation": f"{now.strftime('%H:%M')} reconcile: {why}"}
     result = run_wake(conn, cfg, decision, now=now)
     if result.get("mode") != "window":
-        next_floor = occupancy.lie_down(conn, cfg)
-        wake_state.set_next_wake_at(cfg, next_floor.isoformat() if next_floor else None)
+        _rearm_next_wake(conn, cfg)
     return f"reconcile ({why}) -> wake fired (mode={result.get('mode')})"
+
+
+def _rearm_next_wake(conn, cfg: dict) -> None:
+    """Book the default next wake and write it to the durable ledger — the
+    consumed alarm is replaced, never silently lost."""
+    next_at = occupancy.lie_down(conn, cfg)
+    wake_state.set_next_wake_at(cfg, next_at.isoformat() if next_at else None)
 
 
 def _adopt_manual_window(cfg: dict) -> str | None:
@@ -225,7 +230,7 @@ def _reconcile(conn, cfg: dict, st: dict, now) -> str | None:
     from cortex.wake import _window_alive
 
     from cortex import breaker
-    if breaker.holds(cfg, "cli"):
+    if breaker.holds(cfg, config.shell_id(cfg)):
         return breaker.held_line(cfg, "reconcile + reaps + injections held")
     if _window_alive(cfg):
         return None  # alive -> never touch; normal flow handles it

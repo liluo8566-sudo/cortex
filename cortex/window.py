@@ -487,11 +487,19 @@ def write_note(cfg: dict, text: str, shell: str | None = None,
     """Persist the wakeup note into THIS shell's section of the note file and
     return the path. The marrow hook reads its own section to inject the full
     note when it sees the bell line. Other shells' sections are left intact
-    (note_file.write_section: flock + read-modify-write)."""
+    (note_file.write_section: flock + read-modify-write).
+
+    `sid` labels the section heading; omitted -> this shell's recorded claude
+    sid (wake_state.shell_claude_sid), so a caller without a transcript in hand
+    still produces an attributed heading."""
     from cortex import note, note_file
 
+    shell = shell or note.CLI_SHELL
     note_path = wake_state.wakeup_note_path(cfg)
-    note_file.write_section(note_path, shell or note.CLI_SHELL, text, sid)
+    note_file.write_section(
+        note_path, shell, text,
+        sid or wake_state.shell_claude_sid(cfg, shell),
+        sid_for=lambda s: wake_state.shell_claude_sid(cfg, s))
     return note_path
 
 

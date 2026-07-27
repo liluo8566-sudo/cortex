@@ -200,16 +200,17 @@ def _announce_trip(cfg: dict, message: str) -> None:
 
 
 def _record_fuse(cfg: dict) -> None:
-    """Tally this cli fuse in the shared rolling window and, on a threshold
+    """Tally this shell's fuse in the shared rolling window and, on a threshold
     breach, trip the breaker for ALL shells. Never raises — a fuse must still
     run its handoff/lie_down ladder even if the tally file is unwritable."""
+    shell = config.shell_id(cfg)
     try:
         cfg_dir = config.marrow_config_dir(cfg)
-        count, tripped = breaker.record_fuse_and_maybe_trip(cfg_dir, "cli")
+        count, tripped = breaker.record_fuse_and_maybe_trip(cfg_dir, shell)
     except Exception as e:  # noqa: BLE001
         _log(f"breaker: fuse tally failed ({e})")
         return
-    _log(f"breaker: fuse recorded (cli), {count} in window")
+    _log(f"breaker: fuse recorded ({shell}), {count} in window")
     if tripped is None:
         return
     message = breaker.trip_message(cfg_dir, count, tripped["scope"])
@@ -411,14 +412,18 @@ def _deliver_ct_notes(cfg: dict, line: str) -> None:
 
 
 def _stamp_free_round():
-    """Mutator (run under conditional_mutate): stamp tuck_pending = now as the
-    "last free-round injection" marker, unconditionally (used by both the
-    silence-cycle and the kick-carrier fires — each successful injection re-arms
-    from this instant, closed loop). Awake-only; a session that already slept
-    under us must not be stamped. Returns True on stamp."""
+    """Mutator (run under conditional_mutate): CLAIM this free round. Bumps gen,
+    so a second racer holding the same pre-claim token (watchdog poll vs daemon
+    business tick, both running silence_action) fails its own token check and
+    delivers nothing — exactly one injection per round. Then stamps
+    `tuck_pending` (persisted key name; it holds the "last free-round injection
+    at" timestamp) so the cycle re-arms from this instant. Symmetric with
+    claim_lie_down, which bumps for the same reason. Awake-only; a session that
+    already slept under us must not be stamped. Returns True on claim."""
     def _m(d: dict) -> bool:
         if not d.get("awake"):
             return False
+        d["gen"] = int(d.get("gen") or 0) + 1
         d["tuck_pending"] = datetime.now(timezone.utc).isoformat()
         return True
     return _m
@@ -542,7 +547,7 @@ def run(cfg: dict) -> int:
             return 0  # cortex lay down on its own -> watchdog retires
         # Window liveness gate: an accidentally-closed window leaves the ledger
         # awake, so silence_action / _fuse below would forge a proxy lie_down
-        # (writing a future next_wake_at floor that starves the reconcile rescue
+        # (writing a future next_wake_at that starves the reconcile rescue
         # branch). A dead window must never receive a proxy sleep from here —
         # retire and let daemon reconcile (dead+awake+no-alarm -> resume) own
         # the revival.
@@ -551,7 +556,7 @@ def run(cfg: dict) -> int:
             _log("window dead -> no proxy sleep, watchdog retires; "
                  "reconcile owns revival")
             return 0
-        if breaker.holds(cfg, "cli"):
+        if breaker.holds(cfg, config.shell_id(cfg)):
             continue  # breaker: no reaps / tuck-ins / fuse while held
 
         # Silence source = minutes since the last REAL user message (assistant

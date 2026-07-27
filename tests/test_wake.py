@@ -60,7 +60,7 @@ def test_run_wake_creates_ny_symlinks(monkeypatch, marrow_conn, wcfg):
 
 def test_window_failure_alerts_and_gives_up_the_round(monkeypatch, marrow_conn, wcfg):
     """No windowless fallback: a failed window path raises a marrow alert, audits
-    the give-up and returns mode="failed" — the caller re-arms the floor on any
+    the give-up and returns mode="failed" — the caller re-arms the next wake on any
     non-window result and the next tick retries."""
     marrow_conn.execute("CREATE TABLE alerts (id INTEGER PRIMARY KEY, severity TEXT,"
                         " type TEXT, message TEXT, source TEXT)")

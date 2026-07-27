@@ -2,7 +2,8 @@
 
 Mirrors marrow's plist install (gui/<uid> domain, template token resolve).
 Two jobs: the collect tick (StartInterval from tick.collect_interval_sec, so
-cadence stays config-driven) and the always-on wake daemon (KeepAlive). Cortex
+cadence stays config-driven) and the wake daemon (KeepAlive on crash only — a
+clean exit 0 means disabled / shell off / lock held, never relaunch). Cortex
 owns only its own jobs; hooks/MCP belong to marrow.
 
 _RETIRED holds labels this repo used to install (the pacemaker cron). They are

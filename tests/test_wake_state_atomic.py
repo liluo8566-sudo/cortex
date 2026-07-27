@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from cortex import config, lie_down, wake_state
+from cortex import config, db, lie_down, wake_state
 
 
 @pytest.fixture
@@ -50,6 +50,63 @@ def test_mark_kick_round_noop_when_asleep(cfg):
     assert wake_state.peek_kick_round(cfg) is False
 
 
+
+
+def _alerts_table(cfg):
+    conn = db.connect(cfg)
+    conn.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY,"
+                 " severity TEXT, type TEXT, message TEXT, source TEXT)")
+    conn.commit()
+    conn.close()
+
+
+def _alert_rows(cfg):
+    conn = db.connect(cfg)
+    try:
+        return conn.execute(
+            "SELECT type, message FROM alerts").fetchall()
+    finally:
+        conn.close()
+
+
+def _never_locks(monkeypatch):
+    """Every flock attempt fails and the clock jumps past the timeout on the
+    first retry -> the give-up path, without the real 5s wait."""
+    monkeypatch.setattr(wake_state.fcntl, "flock", _boom)
+    ticks = iter(range(0, 10_000_000, 100))
+    monkeypatch.setattr(wake_state, "_mono", lambda: next(ticks))
+
+
+def _boom(*a, **k):
+    raise OSError("locked by someone else")
+
+
+def test_flock_giveup_raises_one_alert(cfg, monkeypatch):
+    """A lock give-up used to be completely silent — the advisory _flock just
+    wrote unlocked. It now leaves ONE alert row, throttled so a stuck lock
+    cannot spam the table."""
+    _alerts_table(cfg)
+    _never_locks(monkeypatch)
+
+    wake_state.update(cfg, awake=True)          # advisory path, proceeds unlocked
+    with pytest.raises(wake_state.StateValidationError):
+        wake_state.current_epoch(cfg)           # strict path, fails closed
+
+    rows = _alert_rows(cfg)
+    assert len(rows) == 1                       # throttled: second give-up silent
+    assert rows[0]["type"] == "cortex_lock_giveup"
+    assert wake_state.load(cfg).get("awake") is True  # the write still landed
+
+
+def test_flock_giveup_alert_rearms_after_throttle(cfg, monkeypatch):
+    _alerts_table(cfg)
+    _never_locks(monkeypatch)
+    cfg["wake"]["lock_alert_throttle_min"] = 0  # no throttle window
+
+    wake_state.update(cfg, awake=True)
+    wake_state.update(cfg, awake=False)
+
+    assert len(_alert_rows(cfg)) == 2
 
 
 def test_lie_down_cli_requires_next_wake_min(cfg, monkeypatch):

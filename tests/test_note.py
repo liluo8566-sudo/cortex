@@ -17,6 +17,9 @@ def cfg(tmp_path):
     # Pure defaults: point load at a nonexistent path so no live cortex.toml leaks in.
     c = config.load(path=tmp_path / "absent.toml")
     c["paths"]["cortex_home"] = str(tmp_path / "home")
+    # Keeps every marrow-side resolution (breaker.json, shell ledgers) under
+    # tmp_path — a default marrow_db would point them at the live dir.
+    c["paths"]["marrow_db"] = str(tmp_path / "marrow.db")
     # These tests assert the note BODY structure (Now: / title). The Fix 5
     # machine-origin tag is a separate first line, verified in test_wake_regime_fixes;
     # blank it here so the body assertions (startswith "Now:" / title) stay exact.
@@ -386,19 +389,34 @@ def test_render_title_empty_omits_it(cfg):
     assert "小道消息" not in text
 
 
-def test_render_force_slept_marker(cfg):
+def test_render_pause_tag_from_breaker(cfg):
+    """The pause tag is the breaker's, and it names the reason."""
+    data = {"last_wake": {"minutes_ago": 40, "force_slept": None},
+            "paused": {"reason": "manual", "scope": "cli"}}
+    text = note.render(cfg, NOW, data)
+    assert "Last active: 40min ago (paused: manual)" in text
+
+
+def test_render_no_pause_tag_when_breaker_clear(cfg):
+    """No breaker -> no tag, whatever ct_wake_log.force_slept says: that column
+    is the cli window's own shutdown ledger, not a per-shell pause state."""
     data = {"last_wake": {"minutes_ago": 40, "force_slept": "timeout"}}
     text = note.render(cfg, NOW, data)
-    assert "Last active: 40min ago (force-slept: timeout)" in text
-
-
-def test_render_auto_sleep_is_neutral(cfg):
-    """force_slept='auto' = routine silence sleep -> NO force-incident tag.
-    Rows stay queryable, but the note reads it as ordinary."""
-    data = {"last_wake": {"minutes_ago": 40, "force_slept": "auto"}}
-    text = note.render(cfg, NOW, data)
     assert "Last active: 40min ago" in text
-    assert "force-slept" not in text
+    assert "force-slept" not in text and "paused" not in text
+
+
+def test_render_pause_tag_empty_config_omits_it(cfg):
+    cfg["note"]["pause_tag"] = ""
+    data = {"last_wake": {"minutes_ago": 40}, "paused": {"reason": "auto_fuse"}}
+    assert "paused" not in note.render(cfg, NOW, data)
+
+
+def test_render_pause_tag_without_activity_line(cfg):
+    """Nothing to report on activity -> the tag still shows: the pause is a fact
+    about the shell, not about the last reply."""
+    text = note.render(cfg, NOW, {"paused": {"reason": "auto_fuse"}})
+    assert text.startswith("Now: ") and "(paused: auto_fuse)" in text
 
 
 def test_render_no_wake_line_ever(cfg):
@@ -433,64 +451,98 @@ def test_last_wake_none_when_only_current(marrow_conn):
     assert note._last_wake(marrow_conn, NOW) is None
 
 
-def test_last_active_newest_row_for_this_shell(marrow_conn, cfg):
-    """Newest ct_activity row for THIS shell's channel gives the minutes; other
-    shells' rows are ignored even when they are more recent. The dead 'ct'
-    channel (cortex as a standalone channel) is never consulted."""
-    ct = (NOW - timedelta(minutes=900)).astimezone(ZoneInfo("UTC")).isoformat()
-    tg = (NOW - timedelta(minutes=1)).astimezone(ZoneInfo("UTC")).isoformat()
-    cli = (NOW - timedelta(minutes=7)).astimezone(ZoneInfo("UTC")).isoformat()
-    marrow_conn.executemany(
+def _stamp_activity(conn, rows):
+    """rows: (minutes_ago, sid, channel)."""
+    conn.executemany(
         "INSERT INTO ct_activity (ts, sid, channel) VALUES (?, ?, ?)",
-        [(ct, "s0", "ct"), (tg, "s1", "tg"), (cli, "s2", "cli")],
-    )
-    marrow_conn.commit()
+        [((NOW - timedelta(minutes=m)).astimezone(ZoneInfo("UTC")).isoformat(),
+          sid, ch) for m, sid, ch in rows])
+    conn.commit()
+
+
+def _register_sids(cfg, cli_sid=None, tg_sid=None):
+    """Write the two shell-owned sid records the render reads."""
+    from cortex import wake_state
+    if cli_sid:
+        wake_state.update(cfg, cortex_claude_sid=cli_sid)
+    if tg_sid:
+        d = config.shell_state_dir(cfg)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "tg.json").write_text(json.dumps({"session_id": tg_sid}),
+                                   encoding="utf-8")
+
+
+def test_last_active_newest_row_for_this_shells_sid(marrow_conn, cfg):
+    """Minutes come from the newest row of THIS shell's own claude sid. The
+    channel column is unusable: channel='cli' tags every cli Claude Code window
+    on the machine, so a stranger session must not read as cortex activity."""
+    _register_sids(cfg, cli_sid="cli-sid", tg_sid="tg-sid")
+    _stamp_activity(marrow_conn, [
+        (1, "some-other-window", "cli"),   # user's own cli session — ignored
+        (3, "tg-sid", "tg"),
+        (7, "cli-sid", "cli"),
+    ])
     la = note._last_active(marrow_conn, cfg, NOW, "cli")
     assert la["minutes_ago"] == 7
-    assert la["ts"] == cli
     la_tg = note._last_active(marrow_conn, cfg, NOW, "tg")
-    assert la_tg["minutes_ago"] == 1
-    assert la_tg["ts"] == tg
+    assert la_tg["minutes_ago"] == 3
 
 
 def test_last_active_defaults_to_cli_shell(marrow_conn, cfg):
     """No shell argument -> the cli shell (the unqualified render)."""
-    cli = (NOW - timedelta(minutes=3)).astimezone(ZoneInfo("UTC")).isoformat()
-    marrow_conn.execute(
-        "INSERT INTO ct_activity (ts, sid, channel) VALUES (?, ?, ?)",
-        (cli, "s2", "cli"))
-    marrow_conn.commit()
+    _register_sids(cfg, cli_sid="cli-sid")
+    _stamp_activity(marrow_conn, [(3, "cli-sid", "cli")])
     assert note._last_active(marrow_conn, cfg, NOW)["minutes_ago"] == 3
 
 
-def test_last_active_none_without_row_for_this_shell(marrow_conn, cfg):
-    """No row on this shell's channel -> None (render falls back to the wake
-    row) — another shell's activity must never fill the gap."""
-    cli = (NOW - timedelta(minutes=2)).astimezone(ZoneInfo("UTC")).isoformat()
-    marrow_conn.execute(
-        "INSERT INTO ct_activity (ts, sid, channel) VALUES (?, ?, ?)",
-        (cli, "s2", "cli"))
-    marrow_conn.commit()
+def test_last_active_none_without_row_for_this_sid(marrow_conn, cfg):
+    """This shell's sid has no row -> None (render falls back to the wake row);
+    another session's activity must never fill the gap."""
+    _register_sids(cfg, cli_sid="cli-sid", tg_sid="tg-sid")
+    _stamp_activity(marrow_conn, [(2, "cli-sid", "cli")])
     assert note._last_active(marrow_conn, cfg, NOW, "tg") is None
 
 
+def test_last_active_none_when_sid_unresolvable(marrow_conn, cfg):
+    """No recorded sid for the shell -> None, never a guess off the channel."""
+    _stamp_activity(marrow_conn, [(2, "whoever", "cli")])
+    assert note._last_active(marrow_conn, cfg, NOW, "cli") is None
+    assert note._last_active(marrow_conn, cfg, NOW, "tg") is None
+
+
+def test_paused_is_per_shell(cfg, tmp_path):
+    """scope=cli tags only the cli note, scope=tg only the tg note, scope=all
+    both — the breaker is the note's single pause source."""
+    from cortex import breaker
+    d = config.marrow_config_dir(cfg)
+    breaker.trip(d, "cli", "manual")
+    assert note._paused(cfg, "cli") == {"reason": "manual", "scope": "cli"}
+    assert note._paused(cfg, "tg") is None
+    breaker.trip(d, "tg", "auto_fuse")
+    assert note._paused(cfg, "cli") is None
+    assert note._paused(cfg, "tg") == {"reason": "auto_fuse", "scope": "tg"}
+    breaker.trip(d, "all", "manual")
+    assert note._paused(cfg, "cli") and note._paused(cfg, "tg")
+    breaker.clear(d)
+    assert note._paused(cfg, "cli") is None and note._paused(cfg, "tg") is None
+
+
 def test_render_last_active_falls_back_to_wake_minutes(cfg):
-    """No last_active -> the line uses the wake row's minutes but keeps the
-    'Last active:' label and the force-slept suffix."""
+    """No last_active -> the line uses the wake row's minutes and keeps the
+    'Last active:' label."""
     data = {"last_wake": {"minutes_ago": 22, "force_slept": "timeout"}}
     text = note.render(cfg, NOW, data)
-    assert "Last active: 22min ago (force-slept: timeout)" in text
+    assert "Last active: 22min ago" in text
 
 
 def test_render_last_active_overrides_wake_minutes(cfg):
-    """last_active minutes win over the wake row's minutes; the suffix still
-    comes from the wake row."""
+    """last_active minutes win over the wake row's minutes."""
     data = {
         "last_wake": {"minutes_ago": 40, "force_slept": "timeout"},
         "last_active": {"minutes_ago": 3},
     }
     text = note.render(cfg, NOW, data)
-    assert "Last active: 3min ago (force-slept: timeout)" in text
+    assert "Last active: 3min ago" in text
 
 
 def test_pending_within_window(cfg, tmp_path, monkeypatch):
@@ -795,30 +847,25 @@ def test_last_wake_none_when_other_shell_only(marrow_conn):
     assert note._last_wake(marrow_conn, NOW, "tg") is None
 
 
-def test_gather_render_hides_other_shells_force_slept(marrow_conn, cfg):
-    """T1 end-to-end: a cli force-slept row does not reach a tg render."""
+def test_gather_render_scopes_wake_fallback_to_its_shell(marrow_conn, cfg):
+    """T1 end-to-end: a cli wake row does not reach a tg render (the fallback
+    minutes are per shell)."""
     ts = (NOW - timedelta(minutes=30)).astimezone(ZoneInfo("UTC")).isoformat()
     marrow_conn.execute(
         "INSERT INTO ct_wake_log (ts, wake, dry_run, force_slept, shell) "
         "VALUES (?, 1, 0, 'ct-pause', 'cli')", (ts,))
     marrow_conn.commit()
     tg_text = note.render(cfg, NOW, note.gather(marrow_conn, cfg, NOW, shell="tg"))
-    assert "force-slept" not in tg_text
+    assert "Last active" not in tg_text
     cli_text = note.render(cfg, NOW, note.gather(marrow_conn, cfg, NOW, shell="cli"))
-    assert "(force-slept: ct-pause)" in cli_text
+    assert "Last active: 30min ago" in cli_text
 
 
-def test_render_force_slept_shows_raw_reason(cfg):
-    """T4: the marker names the row's force_slept value."""
-    for reason in ("ct-pause", "fuse", "stale"):
+def test_render_never_tags_force_slept(cfg):
+    """ct_wake_log.force_slept is the cli window's own shutdown ledger (only
+    lie_down writes it, only for cli), so it can never be the note's pause tag —
+    no force_slept value renders anything."""
+    for reason in ("ct-pause", "fuse", "stale", "auto", "", None):
         text = note.render(cfg, NOW, {"last_wake": {"minutes_ago": 5,
                                                     "force_slept": reason}})
-        assert f"(force-slept: {reason})" in text
-
-
-def test_render_force_slept_silent_for_auto_and_empty(cfg):
-    """T4: 'auto' (routine) and empty stay silent."""
-    for reason in ("auto", "", None):
-        text = note.render(cfg, NOW, {"last_wake": {"minutes_ago": 5,
-                                                    "force_slept": reason}})
-        assert "force-slept" not in text
+        assert "force-slept" not in text and "paused" not in text

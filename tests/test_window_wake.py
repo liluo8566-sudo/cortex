@@ -539,16 +539,16 @@ def test_lie_down_records_tokens(cfg):
     assert wake_state.is_awake(cfg) is False  # marker cleared
 
 
-def test_store_window_tokens_survives_floor_redraw(cfg):
+def test_store_window_tokens_survives_lie_down_save(cfg):
     """store_window_tokens publishes to ct_pacemaker_state and window_tokens_hint
-    reads it back. Survives lie_down's own floor-redraw save_state."""
+    reads it back. Survives lie_down own save_state."""
     from cortex import occupancy
 
     conn = db.connect(cfg)
     try:
         occupancy.store_window_tokens(conn, 88_000)
         assert occupancy.window_tokens_hint(conn) == 88_000
-        # a later floor-redraw save must NOT wipe it out of order
+        # a later lie_down save must NOT wipe it out of order
         occupancy.lie_down(conn, cfg)
         occupancy.store_window_tokens(conn, 90_000)
         assert occupancy.window_tokens_hint(conn) == 90_000
@@ -1078,7 +1078,7 @@ def test_today_tokens_current_window_added_from_live_hint(cfg):
 
 def test_lie_down_returns_next_wake_hm(cfg):
     """lie_down returns next_wake as local HH:MM (the marrow MCP wrapper surfaces
-    it). An explicit next_wake_min pins the next floor to now + N (clamped)."""
+    it). An explicit next_wake_min pins the next wake to now + N (clamped)."""
     from datetime import datetime as _dt
 
     conn = db.connect(cfg)
@@ -1103,7 +1103,7 @@ def test_lie_down_returns_next_wake_hm(cfg):
 
 def test_lie_down_clamps_next_wake_min_to_ceiling(cfg):
     """lie_down(next_wake_min=N) clamps to [0, next_wake_max=360] — the
-    session-facing window, not the floor draw. 999 -> 360."""
+    session-facing window, not the interval itself. 999 -> 360."""
     from datetime import datetime as _dt
 
     conn = db.connect(cfg)

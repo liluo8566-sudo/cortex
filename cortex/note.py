@@ -289,16 +289,22 @@ def _last_wake(conn: sqlite3.Connection, now: datetime,
 
 def _last_active(conn: sqlite3.Connection, cfg: dict, now: datetime,
                  shell: str | None = None) -> dict | None:
-    """Age of THIS shell's last reply, from the newest ct_activity row whose
-    channel is the shell id (cli / tg / wx). Cortex stopped being a standalone
-    channel when it moved inside the tg/cli shells, so the activity rows now
-    carry the host shell's channel. At inject time the current turn's Stop has
-    not fired, so the newest row is the previous reply — no epsilon skip needed.
-    None when the table is absent or has no row for this shell."""
+    """Age of THIS cortex session's last reply: newest ct_activity row for the
+    claude sid this shell runs (wake_state.shell_claude_sid). The `channel`
+    column cannot be used — channel='cli' tags EVERY cli Claude Code window on
+    the machine, so any unrelated session the user types in would read as cortex
+    activity. At inject time the current turn's Stop has not fired, so the newest
+    row is the previous reply — no epsilon skip needed. None when the sid is
+    unresolvable, the table is absent, or the sid has no row (the render then
+    falls back to the wake row)."""
+    from cortex import wake_state
+
+    sid = _safe(wake_state.shell_claude_sid, cfg, shell or CLI_SHELL)
+    if not sid:
+        return None
     try:
         row = conn.execute(
-            "SELECT MAX(ts) AS ts FROM ct_activity WHERE channel = ?",
-            (shell or CLI_SHELL,),
+            "SELECT MAX(ts) AS ts FROM ct_activity WHERE sid = ?", (sid,),
         ).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -309,6 +315,20 @@ def _last_active(conn: sqlite3.Connection, cfg: dict, now: datetime,
     except (TypeError, ValueError):
         return None
     return {"minutes_ago": int(age.total_seconds() // 60), "ts": row["ts"]}
+
+
+def _paused(cfg: dict, shell: str | None = None) -> dict | None:
+    """Is the circuit breaker holding THIS shell down right now? Source of the
+    note's pause tag: the breaker is the only per-shell pause state (scope
+    all/cli/tg). ct_wake_log.force_slept cannot serve — only the cli window ever
+    writes that ledger (lie_down.py), so a tg note could never carry the tag.
+    None when the breaker is clear or does not cover this shell."""
+    from cortex import breaker
+
+    if not breaker.holds(cfg, shell or CLI_SHELL):
+        return None
+    st = breaker.state(cfg) or {}
+    return {"reason": st.get("reason") or "?", "scope": st.get("scope") or "?"}
 
 
 CLI_SHELL = "cli"
@@ -414,13 +434,14 @@ def gather(
     un-injected payload surfaces again — never consumes, never settles.
 
     `shell` (default None = the unqualified/cli render): the shell this note is
-    rendered for. It scopes the wake ledger read (ct_wake_log.shell) AND the
-    last-active read (ct_activity.channel), so one shell's page never shows
-    another shell's rows."""
+    rendered for. It scopes the wake ledger read (ct_wake_log.shell), the
+    last-active read (ct_activity for this shell's own claude sid) and the pause
+    tag (breaker scope), so one shell's page never shows another shell's state."""
     from cortex import wake_state
 
     last_wake = _safe(_last_wake, conn, now, shell)
     last_active = _safe(_last_active, conn, cfg, now, shell)
+    paused = _safe(_paused, cfg, shell)
 
     ws = {}
     try:
@@ -473,6 +494,7 @@ def gather(
         "ct_notes": ct_notes,
         "last_wake": last_wake,
         "last_active": last_active,
+        "paused": paused,
         "active_app": _safe(_frontmost_app),
         "pending": _safe(_pending, cfg, now, default=[]),
         "window_sid": window_sid,
@@ -492,19 +514,23 @@ def render(cfg: dict, now: datetime, data: dict) -> str:
 
     now_seg = f"Now: {now.strftime('%H:%M %a')}"
     last = data.get("last_wake")
-    # Minutes from the cortex session's last reply (ct_activity); fall back to
-    # the prior wake row's age so the line never disappears when activity is
-    # missing. force_slept marker always sourced from the wake row.
+    # Minutes from this shell's own cortex session's last reply (ct_activity by
+    # sid); fall back to the prior wake row's age so the line never disappears
+    # when activity is missing.
     active = data.get("last_active") or last
     if active:
-        seg = f"Last active: {active['minutes_ago']}min ago"
-        # "auto" = routine proxy sleep on the silence path -> render neutrally,
-        # never as a force incident. Only real force incidents get the tag, and
-        # the tag names the raw reason (ct-pause / fuse / stale).
-        reason = last.get("force_slept") if last else None
-        if reason and reason != "auto":
-            seg += f" (force-slept: {reason})"
-        now_seg += f" | {seg}"
+        now_seg += f" | Last active: {active['minutes_ago']}min ago"
+    # Pause tag: the circuit breaker holding THIS shell (note.pause_tag; ""
+    # omits). Per-shell by construction — scope cli tags only cli, tg only tg.
+    paused = data.get("paused")
+    tag = str(_note_cfg(cfg).get("pause_tag") or "")
+    if paused and tag:
+        try:
+            tag = tag.format(reason=paused.get("reason", "?"),
+                             scope=paused.get("scope", "?"))
+        except (KeyError, IndexError, ValueError):
+            pass
+        now_seg += f" {tag}"
     header.append(now_seg)
 
     app = data.get("active_app")

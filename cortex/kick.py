@@ -12,9 +12,8 @@ for the sleeping case: under the wake_state flock + cancellation epoch it
      so silence_action fires the carrier free-round now, delivering the reason
      inline.
   3. if cortex is ASLEEP -> bump gen (cancel any in-flight alarm), clear the
-     floor ledger hold (next_floor_due_at=None => DUE) + the durable next-wake
-     ledger (next_wake_at), then kick the daemon so the freed floor fires a real
-     wake now.
+     durable next-wake ledger (next_wake_at), then kick the daemon so it wakes
+     now.
 
 Reason templates live in cortex config ([kick].reason_*), never hardcoded. The
 reply reason carries her message text (--text) so cortex sees WHAT she said.
@@ -52,30 +51,10 @@ def _append_reason(cfg: dict, d: dict, reason: str) -> None:
     d["kick_reasons"] = reasons[-cap:]
 
 
-def _clear_floor_deadline(cfg: dict) -> None:
-    """Release the floor hold so the floor trigger reads DUE (occupancy owns the
-    ct_pacemaker_state access). Best-effort: any db hiccup leaves the hold — the
-    reconcile still self-heals."""
-    import sqlite3
-
-    from cortex import db, occupancy
-
-    try:
-        conn = db.connect(cfg)
-    except Exception:
-        return
-    try:
-        occupancy.clear_floor_deadline(conn)
-    except sqlite3.Error:
-        pass
-    finally:
-        conn.close()
-
-
 def _notify_daemon(cfg: dict) -> bool:
-    """Kick the wake daemon's socket so it re-reads state now (freed floor +
-    cleared ledger, or the just-marked carrier round). Returns False when the
-    daemon is not reachable."""
+    """Kick the wake daemon's socket so it re-reads state now (cleared ledger,
+    or the just-marked carrier round). Returns False when the daemon is not
+    reachable."""
     import asyncio
 
     from synapse_core.scheduler import send_kick
@@ -140,8 +119,7 @@ def kick(cfg: dict, kind: str, **fields) -> dict:
                     d["kick_round"] = True
                     round_marked = True
                 return
-            # Asleep: cancel any in-flight alarm epoch, drop the durable
-            # ledger. Floor hold is cleared out-of-lock.
+            # Asleep: cancel any in-flight alarm epoch, drop the durable ledger.
             d["gen"] = int(d.get("gen") or 0) + 1
             d.pop("next_wake_at", None)
 
@@ -155,7 +133,6 @@ def kick(cfg: dict, kind: str, **fields) -> dict:
         return {"ok": True, "kind": kind, "awake": True, "ticked": False,
                 "round_opened": round_marked, "delivered": delivered}
 
-    _clear_floor_deadline(cfg)
     delivered = _kick_daemon(cfg, kind)
     return {"ok": True, "kind": kind, "awake": False, "ticked": True,
             "delivered": delivered}

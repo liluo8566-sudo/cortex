@@ -194,7 +194,12 @@ def test_silence_due_in_counts_down_from_awake_since(cfg):
 
 # --- fire path ----------------------------------------------------------
 
-def test_business_fires_wake_and_redraws_ledger_on_non_window(cfg, clock, monkeypatch):
+def _arm_overdue(cfg):
+    wake_state.set_next_wake_at(
+        cfg, (datetime.now(_tz(cfg)) - timedelta(minutes=1)).isoformat())
+
+
+def test_business_fires_wake_and_rearms_ledger_on_non_window(cfg, clock, monkeypatch):
     import cortex.wake as wake_mod
     seen = {}
 
@@ -202,14 +207,42 @@ def test_business_fires_wake_and_redraws_ledger_on_non_window(cfg, clock, monkey
         seen["decision"] = decision
         return {"mode": "failed"}
 
+    cfg["pacemaker"]["dry_run"] = False
     monkeypatch.setattr(wake_mod, "run_wake", fake_run_wake)
-    wake_state.set_next_wake_at(
-        cfg, (datetime.now(_tz(cfg)) - timedelta(minutes=1)).isoformat())
+    _arm_overdue(cfg)
     d = _daemon(cfg, clock)
     line = d.business_once()
     assert seen["decision"]["wake_reasons"] == "next_wake_at"
     assert "mode=failed" in line
-    # the round ended without a window -> a fresh floor is on the ledger again
+    # the round ended without a window -> a fresh alarm is on the ledger again
+    assert wake_state.get_next_wake_at(cfg) is not None
+
+
+def test_business_rearms_ledger_when_run_wake_raises(cfg, clock, monkeypatch):
+    """An exception out of run_wake must reach the SAME re-arm path as a failed
+    round — else the consumed alarm is gone and cortex never wakes again."""
+    import cortex.wake as wake_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("window exploded")
+
+    cfg["pacemaker"]["dry_run"] = False
+    monkeypatch.setattr(wake_mod, "run_wake", boom)
+    _arm_overdue(cfg)
+    line = _daemon(cfg, clock).business_once()
+    assert "error:RuntimeError" in line
+    assert wake_state.get_next_wake_at(cfg) is not None
+
+
+def test_business_dry_run_does_not_wake(cfg, clock, monkeypatch):
+    """[pacemaker].dry_run holds the business path too (it only gated the
+    dead-window reconcile before): log-only, no wake, alarm still re-armed."""
+    import cortex.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "run_wake",
+                        lambda *a, **k: pytest.fail("no wake under dry_run"))
+    _arm_overdue(cfg)
+    line = _daemon(cfg, clock).business_once()
+    assert "dry_run" in line
     assert wake_state.get_next_wake_at(cfg) is not None
 
 

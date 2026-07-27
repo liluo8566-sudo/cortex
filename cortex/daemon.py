@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -193,7 +194,7 @@ class WakeDaemon:
 
     def reconcile_once(self) -> str:
         """Ledger reconcile: the durable alarm ledger is the only wake source
-        (the floor/trigger decision engine is retired)."""
+        (the old trigger decision engine is retired)."""
         cfg = self.cfg
         if not config.shell_enabled(cfg, self.shell):
             return f"{self.shell} shell off (marrow [cortex].shells): reconcile skipped"
@@ -233,15 +234,15 @@ class WakeDaemon:
 
     def _fire_wake(self, cfg: dict, reason: str, now: datetime) -> str:
         """Synthesized decision -> the standard wake pipeline (ctl precedent).
-        A non-window result (mode="failed": the window path could not deliver)
-        finishes here, so redraw the floor + ledger as the tick did — the
-        consumed alarm is re-armed, never silently lost.
+        ANY outcome other than a live window — mode="failed", dry_run, or a
+        raised exception — books the next wake again, so the alarm consumed at
+        fire time is never silently lost.
 
         Ledger-before-delivery: the alarm is consumed the moment this fire is
         decided, not after set_awake has verified the bell landed. Delivery can be
         interrupted (esc) or missed, and an un-consumed alarm is still due — the
         next deadline would re-fire it seconds later. One alarm = one fire; the
-        next one is armed by the lie_down/floor redraw below."""
+        next one is armed by the re-arm below."""
         from cortex.wake import run_wake
         if reason == "next_wake_at":
             wake_state.clear_next_wake_at(cfg)
@@ -250,14 +251,26 @@ class WakeDaemon:
                     "explanation": f"{now.strftime('%H:%M')} daemon wake: {reason}"}
         conn = db.connect(cfg)
         try:
-            result = run_wake(conn, cfg, decision, now=now)
-            if result.get("mode") != "window":
-                next_floor = occupancy.lie_down(conn, cfg)
-                wake_state.set_next_wake_at(
-                    cfg, next_floor.isoformat() if next_floor else None)
-            return f"business wake ({reason}) -> mode={result.get('mode')}"
+            if bool(cfg["pacemaker"].get("dry_run", True)):
+                self._rearm_next_wake(conn, cfg)
+                return f"business wake ({reason}) -> dry_run, next wake re-armed only"
+            try:
+                mode = run_wake(conn, cfg, decision, now=now).get("mode")
+            except Exception as e:  # noqa: BLE001 — a crashed round must still re-arm
+                traceback.print_exc()
+                mode = f"error:{type(e).__name__}"
+            if mode != "window":
+                self._rearm_next_wake(conn, cfg)
+            return f"business wake ({reason}) -> mode={mode}"
         finally:
             conn.close()
+
+    @staticmethod
+    def _rearm_next_wake(conn, cfg: dict) -> None:
+        """Book the default next wake and write it to the durable ledger."""
+        next_at = occupancy.lie_down(conn, cfg)
+        wake_state.set_next_wake_at(
+            cfg, next_at.isoformat() if next_at else None)
 
 
 # --- process entry ------------------------------------------------------

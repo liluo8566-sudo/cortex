@@ -1,5 +1,5 @@
 """cortex.kick (reasons v2 + T1 kick_round carrier): under flock + epoch, asleep
-= gen bump + floor clear + one daemon kick; awake = reason
+= gen bump + ledger clear + one daemon kick; awake = reason
 queued + kick_round marked (idempotent) + one detached tick so the watchdog/
 tick silence_action fires the carrier free-round now. Every kick appends a
 rendered reason line (config [kick].reason_*) to wake_state for the next

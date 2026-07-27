@@ -90,6 +90,15 @@ _DEFAULTS: dict[str, Any] = {
         # lie_down(next_wake_min=N) clamp (minutes): [0, next_wake_max], every
         # hour (0 = immediate re-wake).
         "next_wake_max": 360,
+        # Minutes until the next wake when no caller picked one (proxy
+        # lie_down, daemon/ctl/reconcile re-arm after a failed round).
+        # Cross-repo interval contract — keep these three equal:
+        # [wake.watchdog].silent_max_min here, this key, and synapse tg
+        # [cortex].shell_idle_min.
+        "default_sleep_min": 20,
+        # Throttle (minutes) on the wake_state lock give-up alert — one row per
+        # window however many times the lock is lost.
+        "lock_alert_throttle_min": 60,
         # Typed into the window at every free-round injection (silence
         # cycle or kick carrier): the free-round note above it, this line last as
         # the final cue. MUST contain the tuck_in_marker family string
@@ -132,15 +141,11 @@ _DEFAULTS: dict[str, Any] = {
         # OAuth usage % snapshot (marrow subprocess) each collect tick.
         "usage_snapshot": True,
     },
-    # Reconcile knob: gates whether a fired ledger wake actually spawns
-    # (reconcile.py _fire_dead_window) or just redraws the floor, log-only.
+    # Wake brake: gates whether a fired ledger wake actually spawns a window or
+    # is log-only (still re-arming the next wake). Covers both fire paths —
+    # daemon business + reconcile dead-window.
     "pacemaker": {
         "dry_run": True,
-    },
-    "triggers": {
-        # Wake-window interval (minutes) from lie-down. lie_down picks the
-        # next wake: an explicit choice, or this fixed interval when omitted.
-        "floor_min": 55,
     },
     # External-wake (cortex.kick) reason lines rendered as plain lines into the
     # wakeup note (no section header), then cleared on delivery. A bridge/cli
@@ -170,6 +175,10 @@ _DEFAULTS: dict[str, Any] = {
         "title": "",
         # Pending self-schedule entries surface only when due within this window.
         "pending_window_min": 15,
+        # Appended to the "Now: … | Last active: …" line while the circuit
+        # breaker covers THIS shell (scope all/<shell>). {reason} = manual /
+        # auto_fuse, {scope} = all / cli / tg. "" omits the tag.
+        "pause_tag": "(paused: {reason})",
         # Reply-receipt line (C11): one per sent note she has replied to since the
         # last note. {id}/{channel}/{sent_hm}/{replied_hm}/{text} render from the
         # marrow outbox row at note time. "" omits receipts entirely.
@@ -214,7 +223,7 @@ _DEFAULTS: dict[str, Any] = {
 
 _SECTIONS = (
     "core", "paths", "knowledgec", "geofence", "health",
-    "tick", "pacemaker", "triggers", "marrow",
+    "tick", "pacemaker", "marrow",
     "wake", "note", "kick", "outbox", "daemon",
 )
 
@@ -236,6 +245,12 @@ def shell_enabled(cfg: dict, shell: str = "cli") -> bool:
     except (OSError, ValueError, TypeError) as e:
         logger.warning("shell_enabled: marrow config read failed (%s) — using default ['cli']", e)
     return shell.strip().lower() in [str(s).strip().lower() for s in raw]
+
+
+def shell_id(cfg: dict) -> str:
+    """The shell this cortex process drives ([daemon].shell, default 'cli') —
+    the breaker scope and the value stamped on its ct_wake_log rows."""
+    return str((cfg.get("daemon") or {}).get("shell") or "cli")
 
 
 def wake_clamps(cfg: dict) -> dict[str, int]:

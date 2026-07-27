@@ -568,19 +568,50 @@ def test_awake_gate_asleep_still_fires(cfg, monkeypatch):
 
 # --- double-fire guard (watchdog poll + tick awake-branch same window) ---------
 
+def test_free_round_double_fire_single_delivery(awake_window, monkeypatch):
+    """The watchdog poll and the daemon business tick both run silence_action on
+    the same window. Stamping the free round CLAIMS it (bumps gen), so the racer
+    that captured the same pre-claim token aborts — exactly ONE marker line is
+    typed, not two.
+
+    The race is reproduced deterministically: the first caller re-enters
+    silence_action from inside its own (outside-the-lock) note render, i.e.
+    after it captured its token but before it commits."""
+    cfg = awake_window
+    past = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    wake_state.update(cfg, awake_since=past)  # no user turn this wake
+    _TYPED.clear()
+    real_build = watchdog._build_tuck_in_line
+    inner, entered = [], []
+
+    def racing_build(c, mins):
+        if not entered:
+            entered.append(True)  # the racer renders normally, no re-entry
+            inner.append(watchdog.silence_action(c, 0.0))  # the second racer
+        return real_build(c, mins)
+
+    monkeypatch.setattr(watchdog, "_build_tuck_in_line", racing_build)
+
+    outer = watchdog.silence_action(cfg, 0.0)
+
+    assert inner == ["free-round appended"]   # the racer that got there first
+    assert outer is None                      # stale token -> nothing delivered
+    assert len([t for t in _TYPED if "[NEW ROUND]" in t]) == 1
+
+
 def test_lie_down_double_fire_single_effect(awake_window, monkeypatch):
     """Watchdog (60s poll) and tick awake-branch can both proxy lie_down in the
     same window. The atomic awake claim => exactly one acts (real result), the
-    other no-ops; ct_wake_log force_slept + floor redraw happen once each."""
+    other no-ops; ct_wake_log force_slept + next-wake booking happen once each."""
     from cortex import lie_down as lie_down_mod
     from cortex import occupancy
     cfg = awake_window
 
-    redraws = []
-    real_floor = occupancy.lie_down
+    bookings = []
+    real_book = occupancy.lie_down
     monkeypatch.setattr(
         "cortex.occupancy.lie_down",
-        lambda conn, cfg, minutes=None: redraws.append(1) or real_floor(conn, cfg, minutes=minutes))
+        lambda conn, cfg, minutes=None: bookings.append(1) or real_book(conn, cfg, minutes=minutes))
 
     wid = wake_state.load(cfg)["wake_log_id"]
     r1 = lie_down_mod.lie_down(cfg, force_slept="stale")
@@ -591,8 +622,8 @@ def test_lie_down_double_fire_single_effect(awake_window, monkeypatch):
     skipped = [r for r in (r1, r2) if r.get("skipped") == "not awake"]
     assert len(winners) == 1 and len(skipped) == 1
     assert wake_state.is_awake(cfg) is False
-    # Single floor redraw.
-    assert len(redraws) == 1
+    # Single next-wake booking.
+    assert len(bookings) == 1
     # Single ct_wake_log write: force_slept stamped exactly once on this row.
     conn = db.connect(cfg)
     try:

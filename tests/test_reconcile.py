@@ -510,7 +510,7 @@ def test_reconcile_future_hold_short_circuits_the_daemon(cfg, monkeypatch):
 
 def test_fire_dead_window_dry_run_consumes_ledger(cfg):
     """P1-2: a due-ledger fire in dry_run must replace next_wake_at with the
-    freshly redrawn floor, not leave the stale due timestamp (else every
+    freshly booked next wake, not leave the stale due timestamp (else every
     subsequent tick re-fires the same reconcile wake)."""
     cfg["pacemaker"]["dry_run"] = True
     now = datetime.now(_tz(cfg))
@@ -590,6 +590,22 @@ def test_ctl_pause_puts_live_cli_window_down(cfg, monkeypatch):
     line = ctl.cmd_pause(cfg)
     assert seen.get("force_slept") == "ct-pause"
     assert "put down" in line
+
+
+def test_ctl_pause_books_no_next_wake(cfg, monkeypatch):
+    """A pause is a pure stop: it must leave NO alarm on the ledger (the fuse /
+    stale proxy paths still book the default one). Only a manual ct-wake
+    resumes, and that fires its own round."""
+    from cortex import ctl, transcript
+    monkeypatch.setattr("cortex.lie_down._notify_daemon", lambda *a, **k: None)
+    monkeypatch.setattr(transcript, "window_tokens", lambda c: 0)
+    wake_state.set_awake(cfg, 1, None)
+    wake_state.set_next_wake_at(cfg, datetime.now(_tz(cfg)).isoformat())
+
+    ctl.cmd_pause(cfg)
+
+    assert wake_state.get_next_wake_at(cfg) is None
+    assert wake_state.is_awake(cfg) is False
 
 
 def test_ctl_pause_is_silent_no_outbox_row(cfg):

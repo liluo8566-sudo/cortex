@@ -25,8 +25,14 @@
   <key>RunAtLoad</key>
   <true/>
 
+  <!-- Restart only on a crash. The daemon exits 0 when it is disabled, the
+       shell is off, or another instance holds the lock — an unconditional
+       KeepAlive relaunched it every ThrottleInterval forever. -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
 
   <key>ThrottleInterval</key>
   <integer>10</integer>

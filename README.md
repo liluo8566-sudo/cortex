@@ -33,7 +33,7 @@ Assumes [marrow](../marrow) + synapse already installed and a Claude Code max pl
    ```
    `python -m cortex.install remove` unloads them (retired jobs are unloaded too, their plist file left in place).
 
-Ships with `pacemaker.dry_run = true` — reconcile logs a due wake and redraws the floor without actually waking until you flip it.
+Ships with `pacemaker.dry_run = true` — a due wake is logged and the next one re-armed, without actually waking, until you flip it.
 
 ## How it works
 

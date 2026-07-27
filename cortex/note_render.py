@@ -58,9 +58,14 @@ def main() -> None:
         text = note.render(cfg, now, data)
         if args.mirror:
             from cortex import note_file, wake_state
-            note_file.write_section(wake_state.wakeup_note_path(cfg),
-                                    args.shell or note.CLI_SHELL,
-                                    text, window_sid)
+            shell = args.shell or note.CLI_SHELL
+            # Heading sid = this shell's recorded claude sid (the same id the
+            # note's Last-active line is read for); the caller's transcript stem
+            # is only the fallback, so every shell labels its section alike.
+            sid = wake_state.shell_claude_sid(cfg, shell) or window_sid
+            note_file.write_section(
+                wake_state.wakeup_note_path(cfg), shell, text, sid,
+                sid_for=lambda s: wake_state.shell_claude_sid(cfg, s))
         print(text)
     finally:
         conn.close()
