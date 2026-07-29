@@ -175,8 +175,8 @@ _DEFAULTS: dict[str, Any] = {
         "title": "",
         # Pending self-schedule entries surface only when due within this window.
         "pending_window_min": 15,
-        # Appended to the "Now: … | Last active: …" line while the circuit
-        # breaker covers THIS shell (scope all/<shell>). {reason} = manual /
+        # Appended to the "🐆 Last active: …" line while the circuit breaker
+        # covers THIS shell (scope all/<shell>). {reason} = manual /
         # auto_fuse, {scope} = all / cli / tg. "" omits the tag.
         "pause_tag": "(paused: {reason})",
         # Reply-receipt line (C11): one per sent note she has replied to since the

@@ -38,6 +38,7 @@ BREAKER_FILE = "breaker.json"
 FUSE_FILE = "fuse_events.json"
 
 SCOPE_ALL = "all"
+SHELLS = ("cli", "tg")
 REASON_AUTO = "auto_fuse"
 REASON_MANUAL = "manual"
 
@@ -161,14 +162,30 @@ def trip(config_dir: Path | str, scope: str = SCOPE_ALL,
     return state
 
 
-def clear(config_dir: Path | str) -> bool:
-    """Remove the breaker entirely. True when one was standing."""
+def clear(config_dir: Path | str, shell: str | None = None) -> bool:
+    """Release the breaker. `shell=None` removes the record entirely (all
+    shells). A `shell` releases only that half, mirroring `trip`'s per-shell
+    scope: scope "all" NARROWS to the other shell (reason/ts preserved — it is
+    the same hold, just smaller), scope == shell removes the record, any other
+    scope is a no-op. True when something was released."""
     p = breaker_path(config_dir)
+    target = str(shell).strip().lower() if shell else None
     with _flock(p):
-        had = read(config_dir) is not None
-        with contextlib.suppress(OSError):
-            p.unlink(missing_ok=True)
-    return had
+        state = read(config_dir)
+        if target is None:
+            with contextlib.suppress(OSError):
+                p.unlink(missing_ok=True)
+            return state is not None
+        if state is None or target not in SHELLS:
+            return False
+        if state["scope"] == target:
+            with contextlib.suppress(OSError):
+                p.unlink(missing_ok=True)
+            return True
+        if state["scope"] == SCOPE_ALL:
+            _write_json(p, {**state, "scope": next(s for s in SHELLS if s != target)})
+            return True
+        return False
 
 
 # --- fuse tally ----------------------------------------------------------
@@ -253,8 +270,8 @@ def pause(cfg: dict, scope: str = SCOPE_ALL) -> dict:
     return trip(_dir(cfg), scope, REASON_MANUAL)
 
 
-def release(cfg: dict) -> bool:
-    return clear(_dir(cfg))
+def release(cfg: dict, shell: str | None = None) -> bool:
+    return clear(_dir(cfg), shell)
 
 
 def held_line(cfg: dict, what: str) -> str:

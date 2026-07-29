@@ -1,4 +1,4 @@
-2026-07-27
+2026-07-29
 
 # Cortex — MAP
 
@@ -90,7 +90,7 @@ wake daemon (launchd KeepAlive, always on) ──reconcile (60s cadence)──�
 ### watchdog (`watchdog.py`)
 - Per-wake detached subprocess spawned at set_awake; pidfile self-guarded (unlinks only own pid, watchdog.py:29-40,169-181). Not started when marrow's `[cortex].shells` omits "cli" (watchdog.py:588-589, config.shell_enabled).
 - Poll 60s: retires when awake cleared externally; publishes occupancy via store_window_tokens each poll.
-- Fuse: window_tokens>=fuse_tokens (180k; marrow's 160k soft nudge fires first) → _fuse then exit; else silence_action (watchdog.py:458-511).
+- Fuse: window_tokens>=[wake.watchdog].fuse_tokens (300k live; marrow's 150k soft nudge fires first) → _fuse then exit; else silence_action (watchdog.py:458-511).
 - Silence loop (silence_action, watchdog.py:394-485, shared by watchdog.run + _handle_awake + daemon business): every silent_max_min (20) of user silence → inject one free-round block → re-arm the SAME timer from that instant → repeat forever. The session stays up until it calls lie_down itself.
 - Silence basis (wake_state.silence_basis_min): newest of the transcript read and the hook-stamped `last_user_msg_ts`, else awake_since when the user never spoke this wake. The transcript lags the marrow hook, which drops tuck_pending in the same write — transcript-only re-fires a round on top of the user's own message.
 - tuck_pending (last-fire marker) is stamped under the epoch lock BEFORE delivery, so an esc-interrupted or failed injection is still consumed (no retry, no re-fire inside the window).
@@ -116,12 +116,13 @@ wake daemon (launchd KeepAlive, always on) ──reconcile (60s cadence)──�
 - Handoff: per-shell rolling log `<cortex_home>/handoff-<shell>.md` (cli default config.DEFAULT_HANDOFF, override paths.handoff_file). Read via the session's own CLAUDE.md memory import; page-turn is marrow-side (marrow/MAP.md §6.3). Cortex reads its mtime only — fuse "handoff written?" (watchdog.py:206).
 ## 6. Wakeup note (`note.py`)
 - gather (note.py:311-340): every section behind _safe(), render pure, omit cleanly when absent (386-446).
-- Sections: header = 2 lines only, `Now HH:MM Day | Last active` [+ pause tag] and `Active (Mac)` · Pending self-schedule (note.pending_window_min 15).
-- Visible note = 3 lines: note.wake_machine_tag, `Now … | Last active …`, `Active (Mac)`. turn_end_text + title default "" (omitted). "Wake:" reason line retired.
+- Sections: header = 📍 location (if any) + merged Last-active/Current-active line, then Pending self-schedule (note.pending_window_min 15). No `Now HH:MM Day` line — per-turn hook already injects current time.
+- Visible note = tag, 📍 (if location state present), `🐆 Last active: Xmin ago [+ pause tag] | 💻 Current active: <app>` (no app → 🐆 half alone, no trailing pipe). turn_end_text + title default "" (omitted). "Wake:" reason line retired.
+- 📍 location line (T5, plan ct-location-sensor): source `~/.config/marrow/state/sensors/location.json` (marrow OwnTracks receiver, not yet built). Render-only: gather()._location reads+parses, render()._render_location formats. 7 locked shapes: two-hop, no-prev, out/leave, cold-start seeded, cross-day weekday prefix, duration (<60m / else), stale >24h. Missing/corrupt file → no line (zero new cortex config, open-source off by default).
 - No note carries Replay: the engine is deleted; marrow turn_inject is the single replay channel for every session, window and shell alike (marrow/MAP.md §replay).
 - `note_render --shell <id>` (tg bridge passes `--no-ct --shell tg`; marrow passes `--no-ct --mirror --shell <id>`) scopes every per-shell read — gather(shell) picks ct_wake_log rows (shell column), ct_activity rows (this shell's claude sid) and the pause tag (breaker scope).
 - `_last_active` = `MAX(ts) FROM ct_activity WHERE sid = wake_state.shell_claude_sid(cfg, shell)`; sid source: cli → wake_state `cortex_claude_sid`, other shells → `<shell_state_dir>/<shell>.json` `session_id`. Never `ct_activity.channel` — channel='cli' tags every cli Claude Code window on the machine. Sid unresolvable → None → the `_last_wake` fallback minutes (line still omittable).
-- Pause tag (`note.pause_tag`, `(paused: {reason})`, `{scope}` also available; "" omits) = `breaker.holds(cfg, shell)` + the breaker's reason (manual / auto_fuse), appended to the `Now …` line. Per-shell by scope: `cli` tags only the cli note, `tg` only tg, `all` both. Not from ct_wake_log.force_slept — only the cli window writes that ledger (lie_down.py:87), so a tg note could never carry it; the column stays for `_last_wake` and the ctl/watchdog audit.
+- Pause tag (`note.pause_tag`, `(paused: {reason})`, `{scope}` also available; "" omits) = `breaker.holds(cfg, shell)` + the breaker's reason (manual / auto_fuse), appended inside the `🐆 Last active …` line. Per-shell by scope: `cli` tags only the cli note, `tg` only tg, `all` both. Not from ct_wake_log.force_slept — only the cli window writes that ledger (lie_down.py:87), so a tg note could never carry it; the column stays for `_last_wake` and the ctl/watchdog audit.
 - `[note].cortex_channel` survives for one job — `_receipt_channel`, the outbox `from_channel` tag on cortex-authored notes.
 - On-disk note = one file, one section per shell (note_file.py): `## <shell> · sid=<8 chars>` heading, body verbatim with its own line breaks, one blank line between sections, existing order kept and a new shell appended. Sids all-or-nothing: any section without one → every heading bare (`## <shell>`), never mixed. `write_section(..., sid_for=)` re-resolves the other sections' sids live so a degraded write never ratchets the labels away. Heading is display-only — never injected. Writers: `note_render --mirror` (opt-in; the entry stays read-only by default) and `window.write_note(cfg, text, shell, sid)` (wake.py / watchdog.py free-round, cli shell); both default the heading sid to `wake_state.shell_claude_sid`. Every write takes an exclusive flock on `<path>.lock` + read-modify-write + atomic replace, so no shell can drop another's section; a legacy heading-less blob belongs to no shell and is dropped on the first write. marrow reads its own section back (marrow/MAP.md §6.3).
 - No budget / Plan-Used / per-shell Today / Net-Session / Window-SID lines; `note.daily_budget` + `note.shell_labels` config gone. `occupancy.store_window_tokens` still writes window occupancy to ct_pacemaker_state; only reader is `occupancy.window_tokens_hint` (no consumer).
@@ -151,7 +152,7 @@ wake daemon (launchd KeepAlive, always on) ──reconcile (60s cadence)──�
 - Shell id rides `MARROW_CORTEX` (cli/tg; legacy "1" = cli); a channel absent from [cortex].shells runs plain (no cortex tools, no heartbeat). Single source (T6): cortex's `config.shell_enabled()` reads this same marrow key directly, no cortex.toml copy.
 - Hook organs (bodies in cortex_bridge, gated call sites in marrow hooks.py): SessionStart handoff page-turn, line-count (fresh cortex window only) · lie_down deny (rotate/fuse-line blocked until handoff written) · lie_down nudge (non-blocking additionalContext, rotate arg picks its copy) · FUSE/CTL covert bodies.
 - Non-cli shell host = the synapse tg bridge (synapse/MAP.md): owns the scheduler loop, feed turns, token ledger → `<shell_state_dir>/tg.json`, directed kick.
-- turn_inject 100k 亮牌 ([cortex_rotate].show_tokens) · kickout immunity (is_cortex_session(), env-only, not behind enabled).
+- turn_inject 亮牌 ([cortex_rotate].show_tokens, 150k live) · kickout immunity (is_cortex_session(), env-only, not behind enabled).
 - Gates (marrow/MAP.md §6.1): `[cortex].enabled` = organs installed at all (default false); `MARROW_CORTEX` env = this session IS the cortex session.
 - Still marrow-side (marrow/MAP.md §6.5): storage.py migrations v29/v30/v31/v32+v34 · config [cortex]/[cortex_rotate]/[cortex_usage].
 - deploy/commands/ct-clear.md (lie_down(rotate=True)) · _window_tokens_from_transcript in hooks.py (shared).

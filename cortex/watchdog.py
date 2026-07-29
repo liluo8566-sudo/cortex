@@ -223,7 +223,9 @@ def _fuse(cfg: dict, grace: float) -> None:
     and lie_down(rotate=True), then give it a bounded grace window to do so
     itself. If it lies down on its own within grace -> done. On timeout, or no
     reaction, fall back to the force path (SIGINT esc-equivalent + proxy
-    lie_down); force_slept is set only when the handoff was NOT written this
+    lie_down(rotate=True) — same fresh-window respawn as the cooperative path,
+    so a session oversized enough to fuse never wakes back into the same
+    session); force_slept is set only when the handoff was NOT written this
     grace phase, so the catchup marker fires exactly when the handoff is missing.
     Hard deadline on the whole grace phase — the fuse must never hang.
 
@@ -259,7 +261,7 @@ def _fuse(cfg: dict, grace: float) -> None:
     written = _handoff_written(handoff, before_mtime)
     note = _verify_esc_or_hard_interrupt(cfg, grace, "fuse")
     reason = None if written else ("fuse" if not note else f"fuse {note}")
-    lie_down_mod.lie_down(cfg, force_slept=reason)
+    lie_down_mod.lie_down(cfg, force_slept=reason, rotate=True)
 
 
 def _handoff_written(handoff, before_mtime: float | None) -> bool:

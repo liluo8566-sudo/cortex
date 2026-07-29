@@ -5,8 +5,9 @@ probe. Every external source is wrapped in try/except so a failure omits its
 line rather than crashing the wake. render() is pure — no I/O, no DB — so it
 can be unit-tested with synthetic data.
 
-Layout: a header block (Now / Active), then `---`-separated blocks
-for pending self-schedule. The handoff injects at
+Layout: a header block (📍 location, then merged Last-active/Current-active),
+then `---`-separated blocks for pending self-schedule. No "Now: HH:MM Ddd" line
+— the per-turn hook already injects current time. The handoff injects at
 SessionStart (marrow), not here. Cal/Rem lines retired (global inject pending).
 The old "Wake:" reason line is gone — reasons carry no signal (desire engine
 retired, wander-only).
@@ -388,6 +389,97 @@ def _pending(cfg: dict, now: datetime) -> list[dict]:
     return out
 
 
+def _location_path(cfg: dict) -> Path:
+    """marrow's OwnTracks receiver state file (ct-location-sensor T2 schema).
+    Fixed path, no cortex config key (open-source default: absent file -> no
+    line, feature fully off)."""
+    return config.marrow_config_dir(cfg) / "state" / "sensors" / "location.json"
+
+
+def _location(cfg: dict) -> dict | None:
+    """Parsed location.json, or None when absent/corrupt (no line rendered)."""
+    try:
+        raw = json.loads(_location_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _parse_local(ts_iso: str, cfg: dict) -> datetime:
+    """location.json timestamps are ISO local (naive or offset-aware); a naive
+    string is the configured local wall clock, never UTC."""
+    dt = datetime.fromisoformat(ts_iso)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=_tz(cfg))
+
+
+def _loc_hm(ts_iso: str, now: datetime, cfg: dict) -> str:
+    """HH:MM, weekday-prefixed (`Tue 22:30`) when the clock is not from today."""
+    dt = _parse_local(ts_iso, cfg).astimezone(_tz(cfg))
+    hm = dt.strftime("%H:%M")
+    return hm if dt.date() == now.date() else f"{dt.strftime('%a')} {hm}"
+
+
+def _loc_duration(delta: timedelta) -> str:
+    """<60m -> `45m`; else `2h15m`."""
+    minutes = max(0, int(delta.total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60}m"
+
+
+def _render_location(cfg: dict, now: datetime, loc: dict) -> str | None:
+    """The 📍 line (plan ct-location-sensor T5, 7 locked shapes). Priority:
+    stale signal loss > cold-start seed > out (leave, no zone) > arrived (with
+    or without a prior hop). Any field the locked shapes don't cover -> no
+    line — never invent a time or zone."""
+    zone = loc.get("zone")
+    since = loc.get("since")
+    seeded = bool(loc.get("seeded"))
+    prev = loc.get("prev") if isinstance(loc.get("prev"), dict) else None
+    last_seen = loc.get("last_seen")
+
+    if last_seen:
+        try:
+            elapsed = now - _parse_local(last_seen, cfg)
+        except (TypeError, ValueError):
+            elapsed = None
+        if elapsed is not None and elapsed.total_seconds() > 24 * 3600:
+            name = zone or (prev.get("zone") if prev else None)
+            if not name:
+                return None
+            return f"📍 {name} (no signal {int(elapsed.total_seconds() // 3600)}h)"
+
+    if zone and seeded and not since:
+        return f"📍 {zone}"
+
+    if not zone:
+        if not since or not prev or not prev.get("zone"):
+            return None
+        try:
+            hm = _loc_hm(since, now, cfg)
+            dur = _loc_duration(now - _parse_local(since, cfg))
+        except (TypeError, ValueError):
+            return None
+        return f"📍 {hm} Left {prev['zone']} ({dur})"
+
+    if not since:
+        return None
+    try:
+        hm = _loc_hm(since, now, cfg)
+        dur = _loc_duration(now - _parse_local(since, cfg))
+    except (TypeError, ValueError):
+        return None
+    cur_hop = f"{hm} Arrived {zone}"
+    if prev and prev.get("zone") and prev.get("ts"):
+        try:
+            p_hm = _loc_hm(prev["ts"], now, cfg)
+        except (TypeError, ValueError):
+            return f"📍 {cur_hop} ({dur})"
+        verb = "Left" if prev.get("event") == "leave" else "Arrived"
+        return f"📍 {p_hm} {verb} {prev['zone']} → {cur_hop} ({dur})"
+    return f"📍 {cur_hop} ({dur})"
+
+
 # --------------------------------------------------------------------------- #
 # gather / render
 # --------------------------------------------------------------------------- #
@@ -497,6 +589,7 @@ def gather(
         "paused": paused,
         "active_app": _safe(_frontmost_app),
         "pending": _safe(_pending, cfg, now, default=[]),
+        "location": _safe(_location, cfg),
         "window_sid": window_sid,
         "awake_since_hm": awake_since_hm,
     }
@@ -505,37 +598,55 @@ def gather(
 def render(cfg: dict, now: datetime, data: dict) -> str:
     """Pure assembly: data dict -> wakeup note text. No DB / no I/O.
 
-    Layout (plan §一): a header block (Now / Active), then
-    `---`-separated blocks for pending self-schedule, then a final
-    turn-end reminder line (note.turn_end_text, every render; "" omits it).
-    Handoff no longer lives here — it is injected at SessionStart on a
-    fresh window."""
+    Layout (locked header format): machine tag, then 📍 location (if any),
+    then one merged "🐆 Last active ... | 💻 Current active ..." line, then
+    `---`-separated blocks for pending self-schedule, then a final turn-end
+    reminder line (note.turn_end_text, every render; "" omits it). No "Now:
+    HH:MM Ddd" line — the per-turn hook already injects current time. Handoff
+    no longer lives here — it is injected at SessionStart on a fresh window."""
     header: list[str] = []
 
-    now_seg = f"Now: {now.strftime('%H:%M %a')}"
+    # 📍 location line (ct-location-sensor T5): the first header line, right
+    # after the machine-tag line (prepended below) — absent/corrupt
+    # location.json -> no line, never a section header.
+    loc = data.get("location")
+    if loc:
+        loc_line = _safe(_render_location, cfg, now, loc)
+        if loc_line:
+            header.append(loc_line)
+
     last = data.get("last_wake")
     # Minutes from this shell's own cortex session's last reply (ct_activity by
     # sid); fall back to the prior wake row's age so the line never disappears
     # when activity is missing.
     active = data.get("last_active") or last
-    if active:
-        now_seg += f" | Last active: {active['minutes_ago']}min ago"
     # Pause tag: the circuit breaker holding THIS shell (note.pause_tag; ""
     # omits). Per-shell by construction — scope cli tags only cli, tg only tg.
     paused = data.get("paused")
     tag = str(_note_cfg(cfg).get("pause_tag") or "")
+    pause_suffix = ""
     if paused and tag:
         try:
-            tag = tag.format(reason=paused.get("reason", "?"),
-                             scope=paused.get("scope", "?"))
+            pause_suffix = " " + tag.format(reason=paused.get("reason", "?"),
+                                            scope=paused.get("scope", "?"))
         except (KeyError, IndexError, ValueError):
-            pass
-        now_seg += f" {tag}"
-    header.append(now_seg)
+            pause_suffix = " " + tag
+
+    active_seg = None
+    if active:
+        active_seg = f"🐆 Last active: {active['minutes_ago']}min ago{pause_suffix}"
+    elif pause_suffix:
+        # The pause is a fact about the shell, not about the last reply — it
+        # still shows even without an activity line.
+        active_seg = f"🐆{pause_suffix}"
 
     app = data.get("active_app")
-    if app:
-        header.append(f"Active (Mac): {app}")
+    if active_seg and app:
+        header.append(f"{active_seg} | 💻 Current active: {app}")
+    elif active_seg:
+        header.append(active_seg)
+    elif app:
+        header.append(f"💻 Current active: {app}")
 
     blocks: list[str] = ["\n".join(header)]
 
@@ -569,8 +680,8 @@ def render(cfg: dict, now: datetime, data: dict) -> str:
         note_text += "\n\n" + turn_end.format_map(_ClampDefaults(config.wake_clamps(cfg)))
 
     # Title and machine tag join the header block with a single newline (no
-    # blank line): the approved note opens with tag / "Now:" / "Active (Mac):"
-    # on three consecutive lines, in every shape.
+    # blank line): the locked note opens with tag / 📍 (if any) / merged
+    # Last-active·Current-active line, on consecutive lines, in every shape.
     title = _note_cfg(cfg).get("title", "")
     if title:
         note_text = title + "\n" + note_text

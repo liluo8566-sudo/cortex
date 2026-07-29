@@ -10,7 +10,8 @@ hand without racing the reconcile.
   pause           throw the circuit breaker: stop cortex autonomous activity
                   (auto wake / spawn / fed round) for all shells, or one shell
                   with --shell. Persistent across restarts.
-  resume          clear the breaker without waking
+  resume          release the breaker without waking — all shells, or one
+                  shell with --shell (scope "all" narrows to the other shell)
   status          print the breaker + ledger state
 
 Each subcommand prints one human-readable result line.
@@ -156,12 +157,22 @@ def cmd_pause(cfg: dict, shell: str | None = None) -> str:
             f"activity held until ct-wake{extra}")
 
 
-def cmd_resume(cfg: dict) -> str:
-    released = breaker.release(cfg)
+def cmd_resume(cfg: dict, shell: str | None = None) -> str:
+    """Release the breaker without waking. Default clears every shell; --shell
+    releases one half (scope "all" narrows to the other shell)."""
+    released = breaker.release(cfg, shell)
+    st = breaker.state(cfg)
     if not released:
+        if shell and st is not None:
+            return (f"resume: breaker holds scope={st['scope']} only — "
+                    f"{shell} was not held")
         return "resume: breaker already clear — nothing held"
-    settings = breaker.settings(config.marrow_config_dir(cfg))
-    _receipt(cfg, str(settings["clear_message"]))
+    # The receipt lands on tg, so only announce a clear that actually frees tg.
+    if shell is None or shell == "tg":
+        settings = breaker.settings(config.marrow_config_dir(cfg))
+        _receipt(cfg, str(settings["clear_message"]))
+    if st is not None:
+        return (f"resume: breaker OFF for {shell} — still ON scope={st['scope']}")
     return "resume: breaker OFF — overdue ledger alarms fire on the next reconcile"
 
 
@@ -190,7 +201,9 @@ def main(argv: list[str] | None = None) -> int:
     pp = sub.add_parser("pause", help="breaker ON — stop cortex autonomous activity")
     pp.add_argument("--shell", default=None, choices=["cli", "tg"],
                     help="hold ONE shell only (default: all)")
-    sub.add_parser("resume", help="breaker OFF (without waking)")
+    rp = sub.add_parser("resume", help="breaker OFF (without waking)")
+    rp.add_argument("--shell", default=None, choices=["cli", "tg"],
+                    help="release ONE shell only (default: all)")
     sub.add_parser("status", help="breaker + ledger state")
     args = parser.parse_args(argv)
 
@@ -204,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "status":
         line = cmd_status(cfg)
     else:
-        line = cmd_resume(cfg)
+        line = cmd_resume(cfg, args.shell)
     print(line)
     return 0
 

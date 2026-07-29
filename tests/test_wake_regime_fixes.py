@@ -540,22 +540,18 @@ def test_fresh_path_still_uses_new_file_snapshot(cfg, monkeypatch):
 def test_note_render_prepends_machine_tag(cfg):
     """Fix 5: the rendered wake note opens with the config-driven machine tag so
     the model treats the delivering ☀️ turn as an automated scheduler signal,
-    not user speech. Approved shape: tag / "Now:" / "Active (Mac):" on three
-    consecutive lines — no blank line between the tag and the body."""
+    not user speech. Locked header shape: tag / merged Last-active·Current-
+    active line, consecutive — no blank line between the tag and the body."""
     from cortex import note
 
-    conn = db.connect(cfg)
-    try:
-        now = datetime.now(timezone.utc)
-        text = note.render(cfg, now, note.gather(conn, cfg, now))
-    finally:
-        conn.close()
+    now = datetime.now(timezone.utc)
+    text = note.render(cfg, now, {"last_active": {"minutes_ago": 5}})
     tag = cfg["note"]["wake_machine_tag"]
     assert tag  # default is non-empty
     assert text.startswith(tag)
     lines = text.split("\n")
     assert lines[0] == tag
-    assert lines[1].startswith("Now:"), f"blank/wrong line after tag: {lines[:3]!r}"
+    assert lines[1].startswith("🐆 Last active:"), f"blank/wrong line after tag: {lines[:3]!r}"
 
 
 def test_note_render_machine_tag_config_toggle(cfg):

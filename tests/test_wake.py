@@ -40,7 +40,7 @@ def wcfg(base_cfg, tmp_path):
 
 def test_assemble_note_real_data(marrow_conn, wcfg):
     text = wake.assemble_note(marrow_conn, wcfg, DAY1)
-    assert text.startswith("Now:")  # note leads with Now; Wake reason line retired
+    assert "Now:" not in text  # Now line deleted — hook injects current time
     assert "Wake:" not in text
     assert len(text) < 1000
 
@@ -359,8 +359,10 @@ def test_main_print_note_no_marrow_call(monkeypatch, marrow_conn, wcfg, capsys):
     rc = wake.main(["--print-note"])
 
     assert rc == 0
+    # wcfg carries no [note] config -> an empty note (just the trailing
+    # newline from print()) is the correct, legitimate output here.
     out = capsys.readouterr().out
-    assert "Now:" in out
+    assert out == "\n"
 
 
 def test_main_force_wake_tags_ctl_reasons(monkeypatch, marrow_conn, wcfg):

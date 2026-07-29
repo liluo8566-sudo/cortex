@@ -39,7 +39,8 @@ def test_fuse_session_lies_down_itself_no_force(cfg, monkeypatch):
     _stub_window(monkeypatch, calls)
     forced = []
     monkeypatch.setattr(lie_down_mod, "lie_down",
-                        lambda cfg, force_slept=None: forced.append(force_slept))
+                        lambda cfg, force_slept=None, rotate=False:
+                        forced.append(force_slept))
     wake_state.update(cfg, awake=True)
 
     real_load = wake_state.load
@@ -65,12 +66,15 @@ def test_fuse_timeout_no_handoff_forces_with_marker(cfg, monkeypatch):
     calls = []
     _stub_window(monkeypatch, calls)
     forced = []
+    rotated = []
     monkeypatch.setattr(lie_down_mod, "lie_down",
-                        lambda cfg, force_slept=None: forced.append(force_slept))
+                        lambda cfg, force_slept=None, rotate=False:
+                        (forced.append(force_slept), rotated.append(rotate)))
     wake_state.update(cfg, awake=True)  # stays awake through grace
     watchdog._fuse(cfg, grace=0.0)
     assert len(forced) == 1
     assert forced[0] == "fuse"  # no handoff -> force_slept marker fires
+    assert rotated == [True]  # forced fuse rotates to a fresh window
 
 
 def test_fuse_timeout_with_handoff_forces_without_marker(cfg, monkeypatch):
@@ -85,12 +89,15 @@ def test_fuse_timeout_with_handoff_forces_without_marker(cfg, monkeypatch):
         return "bell"
 
     monkeypatch.setattr(watchdog.window, "deliver_covert_marker", fake_deliver)
+    rotated = []
     monkeypatch.setattr(lie_down_mod, "lie_down",
-                        lambda cfg, force_slept=None: forced.append(force_slept))
+                        lambda cfg, force_slept=None, rotate=False:
+                        (forced.append(force_slept), rotated.append(rotate)))
     wake_state.update(cfg, awake=True)
     watchdog._fuse(cfg, grace=0.0)
     assert len(forced) == 1
     assert forced[0] is None  # handoff written -> clean proxy, no catchup marker
+    assert rotated == [True]  # forced fuse rotates to a fresh window
 
 
 def test_run_dead_window_retires_no_proxy_sleep(cfg, monkeypatch):
@@ -103,7 +110,8 @@ def test_run_dead_window_retires_no_proxy_sleep(cfg, monkeypatch):
 
     forced = []
     monkeypatch.setattr(lie_down_mod, "lie_down",
-                        lambda cfg, force_slept=None: forced.append(force_slept))
+                        lambda cfg, force_slept=None, rotate=False:
+                        forced.append(force_slept))
     # If the guard let control reach fuse/silence, these would run; make them
     # loud so a regression is obvious.
     monkeypatch.setattr(watchdog, "_fuse",

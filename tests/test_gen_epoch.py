@@ -146,6 +146,47 @@ def test_bug_a_user_reset_right_after_claim_suppresses_all(cfg, monkeypatch):
     assert st.get("awake") is True              # user reset owns the live wake
 
 
+def _alerts_table(cfg):
+    conn = db.connect(cfg)
+    conn.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY,"
+                 " severity TEXT, type TEXT, message TEXT, source TEXT)")
+    conn.commit()
+    conn.close()
+
+
+def _alert_rows(cfg):
+    conn = db.connect(cfg)
+    try:
+        return conn.execute("SELECT type, message FROM alerts").fetchall()
+    finally:
+        conn.close()
+
+
+def test_rotate_race_alerts_and_does_not_raise(cfg, monkeypatch):
+    """Rotate's conditional_mutate hits a superseded-epoch race (past the
+    _token_ok gate, e.g. a newer claim lands mid-call): lie_down must not
+    raise, rotated stays False, and the give-up is no longer silent — one
+    alerts row plus a wake_audit log line."""
+    _alerts_table(cfg)
+    _seed_awake(cfg, transcript="/t/race.jsonl")
+
+    def _boom(cfg_, token, mutate):
+        raise wake_state.StateValidationError("superseded")
+
+    monkeypatch.setattr(lie_down.wake_state, "conditional_mutate", _boom)
+
+    result = lie_down.lie_down(cfg, force_slept="stale", rotate=True, next_wake_min=20)
+
+    assert result["rotated"] is False
+
+    rows = _alert_rows(cfg)
+    assert len(rows) == 1
+    assert rows[0]["type"] == "cortex_rotate_failed"
+
+    log = config.wake_audit_log_path(cfg).read_text()
+    assert "rotate_failed" in log
+
+
 @pytest.fixture
 def typed(monkeypatch):
     """Capture free-round keystrokes at the window boundary (delivery is typed)."""

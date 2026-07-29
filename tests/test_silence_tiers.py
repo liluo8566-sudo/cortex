@@ -232,8 +232,8 @@ def test_free_round_template_still_substitutes_placeholders(cfg):
 # --- free-round note (every injection carries one) -----------------------------
 
 def test_kick_carrier_tuck_in_carries_fresh_note(awake_window):
-    """A kick-carrier injection carries a freshly rendered note (a `Now:` line)
-    — staged INVISIBLY for the marrow hook, never typed on screen."""
+    """A kick-carrier injection carries a freshly rendered note (the machine
+    tag) — staged INVISIBLY for the marrow hook, never typed on screen."""
     cfg = awake_window
     wake_state.update(cfg, user_replied_this_wake=True)
     wake_state.mark_kick_round(cfg)
@@ -241,8 +241,9 @@ def test_kick_carrier_tuck_in_carries_fresh_note(awake_window):
     assert a1 == "kick free-round appended"
     text = "\n".join(_signal_lines(cfg))
     assert "[NEW ROUND]" in text
-    assert "Now:" not in text        # note stays off the screen
-    assert "Now:" in _staged(cfg)    # delivered invisibly instead
+    tag = cfg["note"]["wake_machine_tag"]
+    assert tag not in text                # note stays off the screen
+    assert tag in _staged(cfg)             # delivered invisibly instead
 
 
 def test_plain_silence_gate_tuck_in_also_carries_note(awake_window):
@@ -253,8 +254,9 @@ def test_plain_silence_gate_tuck_in_also_carries_note(awake_window):
     watchdog.silence_action(cfg, silent_min=21.0)
     text = "\n".join(_signal_lines(cfg))
     assert "[NEW ROUND]" in text
-    assert "Now:" not in text
-    assert "Now:" in _staged(cfg)
+    tag = cfg["note"]["wake_machine_tag"]
+    assert tag not in text
+    assert tag in _staged(cfg)
 
 
 def test_free_round_note_toggle_off(awake_window):
@@ -293,7 +295,7 @@ def test_free_round_mirrors_full_note_to_file(awake_window):
     note_path.write_text("stale", encoding="utf-8")
     watchdog.silence_action(cfg, silent_min=21.0)
     body = note_path.read_text(encoding="utf-8")
-    assert body != "stale" and "Now:" in body
+    assert body != "stale" and cfg["note"]["wake_machine_tag"] in body
 
 
 def test_free_round_note_carries_no_replay_section(awake_window):
@@ -313,7 +315,7 @@ def test_free_round_note_carries_no_replay_section(awake_window):
     wake_state.update(cfg, user_replied_this_wake=True)
     assert watchdog.silence_action(cfg, silent_min=21.0) == "free-round appended"
     staged = _staged(cfg)
-    assert "Now:" in staged                    # the note did land
+    assert cfg["note"]["wake_machine_tag"] in staged   # the note did land
     assert "### Replay" not in staged
     assert "chatter elsewhere" not in staged
 
@@ -399,8 +401,9 @@ def test_free_round_typed_line_is_the_marker_only(cfg):
     line, note_text = watchdog._build_tuck_in_line(cfg, mins=17.0)
     assert line.strip().splitlines() == [line.strip()]      # single line
     assert line.lstrip().startswith("⏳ [NEW ROUND]")
-    assert "Now:" not in line
-    assert "Now:" in note_text                              # note rides invisibly
+    tag = cfg["note"]["wake_machine_tag"]
+    assert tag not in line
+    assert tag in note_text                                 # note rides invisibly
 
 
 def test_failed_type_unstages_the_invisible_note(awake_window, monkeypatch):

@@ -62,6 +62,50 @@ def test_scope_is_per_shell(cdir):
     assert breaker.covers(cdir, "cli") is False
 
 
+def test_clear_shell_narrows_scope_all(cdir):
+    """Releasing one half of an all-shell hold leaves the OTHER shell held,
+    same record (reason/ts preserved) — the hold only got smaller."""
+    st = breaker.trip(cdir, "all", breaker.REASON_AUTO)
+    assert breaker.clear(cdir, "tg") is True
+    after = breaker.read(cdir)
+    assert after["scope"] == "cli"
+    assert after["reason"] == breaker.REASON_AUTO and after["ts"] == st["ts"]
+    assert breaker.covers(cdir, "cli") is True
+    assert breaker.covers(cdir, "tg") is False
+
+
+def test_clear_shell_matching_scope_removes_record(cdir):
+    breaker.trip(cdir, "tg")
+    assert breaker.clear(cdir, "tg") is True
+    assert breaker.read(cdir) is None
+    assert breaker.breaker_path(cdir).exists() is False
+
+
+def test_clear_shell_other_scope_is_a_noop(cdir):
+    breaker.trip(cdir, "cli")
+    assert breaker.clear(cdir, "tg") is False
+    assert breaker.read(cdir)["scope"] == "cli"
+
+
+def test_clear_shell_when_already_clear(cdir):
+    assert breaker.clear(cdir, "cli") is False
+    assert breaker.read(cdir) is None
+
+
+def test_clear_shell_unknown_name_leaves_the_hold(cdir):
+    """An unknown shell has no 'other shell' to narrow to — refuse rather than
+    guess (argparse already restricts the CLI to cli|tg)."""
+    breaker.trip(cdir, "all")
+    assert breaker.clear(cdir, "wx") is False
+    assert breaker.read(cdir)["scope"] == "all"
+
+
+def test_clear_shell_write_is_atomic_no_tmp_left(cdir):
+    breaker.trip(cdir, "all")
+    breaker.clear(cdir, "cli")
+    assert [p.name for p in cdir.iterdir() if ".tmp." in p.name] == []
+
+
 def test_corrupt_file_reads_as_clear(cdir, caplog):
     breaker.breaker_path(cdir).write_text("{not json", encoding="utf-8")
     with caplog.at_level("WARNING"):

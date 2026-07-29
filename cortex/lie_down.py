@@ -168,7 +168,21 @@ def lie_down(cfg: dict, force_slept: str | None = None, rotate: bool = False,
                 rotated = bool(wake_state.conditional_mutate(
                     cfg, token, _mark_rotated(state.get("transcript"))))
             except wake_state.StateValidationError:
-                pass  # superseded -> the newer epoch owns the window, no rotate
+                # Superseded epoch race -> the newer claim owns the window, no
+                # rotate. Must not go silent (the caller would else wake back
+                # into the same un-rotated window with no trace): same
+                # best-effort alerts-row pattern watchdog/wake use.
+                detail = ("rotate skipped: superseded epoch, "
+                          f"transcript={state.get('transcript')}")
+                wake_state.wake_audit(cfg, "rotate_failed", "superseded", detail)
+                try:
+                    conn.execute(
+                        "INSERT INTO alerts (severity, type, message, source)"
+                        " VALUES (?, ?, ?, ?)",
+                        ("warn", "cortex_rotate_failed", detail, "cortex.lie_down"))
+                    conn.commit()
+                except Exception:  # noqa: BLE001 - table may be absent; audit already tried
+                    pass
         # awake marker already cleared atomically by claim_lie_down at entry.
         # The durable ledger carries the alarm; the daemon kick makes it instant.
         persist_next_wake_at(cfg, next_at, token)

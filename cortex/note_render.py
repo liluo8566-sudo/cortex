@@ -1,8 +1,9 @@
 """Render-only CLI: print a FRESH wakeup note to stdout, no side effects.
 
 The wake-time note is assembled once and frozen to disk; a rotated window then
-gets a stale file. This entry re-renders at injection time so "Now:" and the
-Window SID always reflect the caller's current moment and transcript.
+gets a stale file. This entry re-renders at injection time so the location
+(📍) / activity lines and the Window SID always reflect the caller's current
+moment and transcript.
 
 Contract: read-only by default. No ct_wake_log writes, no wake_state writes, no
 shell ledger writes, no Replay (marrow's turn_inject is the single replay
