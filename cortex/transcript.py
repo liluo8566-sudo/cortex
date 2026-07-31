@@ -104,8 +104,34 @@ def newest_window_lineage(cfg: dict, marker: str) -> Path | None:
     return None
 
 
+def window_transcript(cfg: dict) -> Path | None:
+    """The newest GENUINE cortex-window jsonl, resolved WITHOUT the recorded
+    wake_state pointer: newest_window_lineage first, bare newest() only when no
+    candidate carries the marker at all.
+
+    Distinct from resident_transcript on purpose. resident_transcript short-
+    circuits on the recorded pointer, so it can never observe that the window
+    rolled to a different session; callers that COMPARE the current file against
+    the recorded one (wake classification) need this variant, which still skips
+    headless `claude -p` archives sharing the projects dir."""
+    marker = lineage_marker(cfg)
+    if marker:
+        lineage = newest_window_lineage(cfg, marker)
+        if lineage is not None:
+            return lineage
+    return newest(cfg)
+
+
 def mtime(cfg: dict) -> float | None:
-    p = newest(cfg)
+    """Modification time of the RESIDENT window's transcript.
+
+    Resident, not newest: the headless shells (marrow's sessionend digest, the
+    tg cortex) run `claude -p` against the same cwd, so their jsonls land in the
+    same projects dir and are routinely mtime-newest. Reading one of those made
+    every mtime consumer — ear-landing polls, the hard-interrupt probe, the
+    reconcile idle/stale gate, the duty fresh-vs-resume gate — judge a foreign
+    session instead of this window."""
+    p = resident_transcript(cfg)
     return p.stat().st_mtime if p else None
 
 
@@ -379,8 +405,13 @@ def global_user_silent_min(cfg: dict) -> float | None:
 def window_tokens(cfg: dict) -> int:
     """Context-window occupancy = the last assistant message's usage totals
     (input + cache read + cache creation + output). Grows with the conversation;
-    drives rotate (respawn) + fuse thresholds. 0 if no transcript/usage yet."""
-    p = newest(cfg)
+    drives rotate (respawn) + fuse thresholds. 0 if no transcript/usage yet.
+
+    Read from the RESIDENT transcript, never bare newest: a headless `claude -p`
+    run (marrow digest, tg cortex) sharing the projects dir is often mtime-
+    newest, and measuring its occupancy misreports this window's fill to the
+    fuse, the lie_down ledger and the duty fresh-vs-resume gate alike."""
+    p = resident_transcript(cfg)
     if not p:
         return 0
     total = 0

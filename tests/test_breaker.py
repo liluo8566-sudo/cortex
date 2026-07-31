@@ -62,6 +62,54 @@ def test_scope_is_per_shell(cdir):
     assert breaker.covers(cdir, "cli") is False
 
 
+def test_merge_unions_two_single_shell_pauses(cdir):
+    """A manual pause never releases the shell an earlier one holds."""
+    breaker.trip(cdir, "cli", breaker.REASON_MANUAL, merge=True)
+    st = breaker.trip(cdir, "tg", breaker.REASON_MANUAL, merge=True)
+    assert st["scope"] == "all"
+    assert breaker.covers(cdir, "cli") and breaker.covers(cdir, "tg")
+
+
+def test_merge_keeps_scope_all(cdir):
+    breaker.trip(cdir, "all", breaker.REASON_AUTO)
+    st = breaker.trip(cdir, "cli", breaker.REASON_MANUAL, merge=True)
+    assert st["scope"] == "all"
+    assert st["reason"] == "manual"
+    assert breaker.covers(cdir, "tg") is True
+
+
+def test_merge_same_shell_only_refreshes(cdir):
+    first = breaker.trip(cdir, "tg", breaker.REASON_MANUAL, now=_ago(cdir, 1),
+                         merge=True)
+    st = breaker.trip(cdir, "tg", breaker.REASON_MANUAL, merge=True)
+    assert st["scope"] == "tg"
+    assert st["ts"] > first["ts"]
+    assert breaker.covers(cdir, "cli") is False
+
+
+def test_merge_from_clear_writes_the_scope_asked_for(cdir):
+    st = breaker.trip(cdir, "cli", breaker.REASON_MANUAL, merge=True)
+    assert st["scope"] == "cli"
+    assert breaker.covers(cdir, "tg") is False
+
+
+def test_auto_trip_does_not_merge(cdir):
+    """The auto fuse always writes scope "all", which already covers whatever
+    single-shell hold stood before it."""
+    breaker.trip(cdir, "tg", breaker.REASON_MANUAL, merge=True)
+    st = breaker.trip(cdir, "all", breaker.REASON_AUTO)
+    assert st["scope"] == "all" and st["reason"] == "auto_fuse"
+
+
+def test_cfg_pause_merges(cfg, cdir):
+    breaker.pause(cfg, "cli")
+    assert breaker.pause(cfg, "tg")["scope"] == "all"
+
+
+def _ago(cdir, seconds: float) -> datetime:
+    return datetime.now().astimezone() - timedelta(seconds=seconds)
+
+
 def test_clear_shell_narrows_scope_all(cdir):
     """Releasing one half of an all-shell hold leaves the OTHER shell held,
     same record (reason/ts preserved) — the hold only got smaller."""

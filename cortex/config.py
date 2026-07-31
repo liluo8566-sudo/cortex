@@ -21,13 +21,14 @@ DEFAULT_MARROW_DB = Path.home() / ".config" / "marrow" / "marrow.db"
 DEFAULT_KNOWLEDGEC_DB = (
     Path.home() / "Library" / "Application Support" / "Knowledge" / "knowledgeC.db"
 )
-# Per-shell rolling log; this repo is the cli shell (mirror of marrow
-# [cortex].handoff_file_pattern = "handoff-{shell}.md"). Override: paths.handoff_file.
-DEFAULT_HANDOFF = Path.home() / ".config" / "marrow" / "cortex" / "handoff-cli.md"
+# One rolling log shared by every shell (mirror of marrow [cortex].handoff_file).
+# Override: paths.handoff_file.
+DEFAULT_HANDOFF = Path.home() / ".config" / "marrow" / "cortex" / "handoff.md"
 DEFAULT_CORTEX_HOME = Path.home() / ".config" / "marrow" / "cortex"
 DEFAULT_NY_DB_PAGES = Path.home() / "Desktop" / "NY" / "db-pages"
 DEFAULT_MARROW_REPO = Path.home() / "CC-Lab" / "marrow"
 DEFAULT_WAKE_TIMING_LOG = Path.home() / ".config" / "marrow" / "logs" / "wake_timing.log"
+DEFAULT_AWAY_IDLE_MIN = 20
 
 # Single source of truth for the machine-line marker family (wake bell /
 # free-round / fuse / ctl / slash-command). Referenced by _DEFAULTS below AND
@@ -87,9 +88,13 @@ _DEFAULTS: dict[str, Any] = {
         # older than this, and the producer overwrites it on every new bell.
         "receipt_ttl_min": 15,
         "say_sound": "Glass",
-        # lie_down(next_wake_min=N) clamp (minutes): [0, next_wake_max], every
-        # hour (0 = immediate re-wake).
+        # lie_down(next_wake_min=N) legal minutes: two bands, every hour —
+        # [0, next_wake_low_max] and [next_wake_high_min, next_wake_max]
+        # (0 = immediate re-wake). The gap between the bands is unselectable:
+        # a choice landing there snaps to the nearer band edge.
         "next_wake_max": 360,
+        "next_wake_low_max": 55,
+        "next_wake_high_min": 180,
         # Minutes until the next wake when no caller picked one (proxy
         # lie_down, daemon/ctl/reconcile re-arm after a failed round).
         # Cross-repo interval contract — keep these three equal:
@@ -175,8 +180,8 @@ _DEFAULTS: dict[str, Any] = {
         "title": "",
         # Pending self-schedule entries surface only when due within this window.
         "pending_window_min": 15,
-        # Appended to the "🐆 Last active: …" line while the circuit breaker
-        # covers THIS shell (scope all/<shell>). {reason} = manual /
+        # Appended to the "🐆 Cortex last wake: …" line while the circuit
+        # breaker covers THIS shell (scope all/<shell>). {reason} = manual /
         # auto_fuse, {scope} = all / cli / tg. "" omits the tag.
         "pause_tag": "(paused: {reason})",
         # Reply-receipt line (C11): one per sent note she has replied to since the
@@ -219,12 +224,30 @@ _DEFAULTS: dict[str, Any] = {
         # Singleton lock. "" -> <state_dir>/daemon.lock.
         "lock_path": "",
     },
+    # Duty rotation: at most one cortex shell on duty, the other held. State
+    # lives in duty.json beside breaker.json; only ctl/transfer write it.
+    "duty": {
+        # An incoming shell spawns fresh instead of resuming once its window is
+        # this full or this old.
+        "fresh_token_threshold": 80000,
+        "fresh_age_hours": 8,
+        # Source line prepended to the wakeup note of a shell woken BY a duty
+        # rotation, so the session reads why it came up. Placeholders:
+        # {from_shell} = the shell the transfer came from, {shell} = the shell
+        # now on duty, {hold} = the hold the rotation materialised. "" omits the
+        # line; an auto wake carries none of these.
+        "transfer_source_text":
+            "🔄 transferred from {from_shell} | {shell} on, {hold} hold",
+        "ctl_source_text": "Kicked by /ct-duty - {shell} on, {hold} hold",
+        # Rendered for {hold} when the mode holds nothing (mode all).
+        "hold_none_label": "no",
+    },
 }
 
 _SECTIONS = (
     "core", "paths", "knowledgec", "geofence", "health",
     "tick", "pacemaker", "marrow",
-    "wake", "note", "kick", "outbox", "daemon",
+    "wake", "note", "kick", "outbox", "daemon", "duty",
 )
 
 
@@ -247,6 +270,26 @@ def shell_enabled(cfg: dict, shell: str = "cli") -> bool:
     return shell.strip().lower() in [str(s).strip().lower() for s in raw]
 
 
+def away_idle_min(cfg: dict) -> int:
+    """Minutes of HID idle before the wake note reports Away.
+
+    The shared marrow config's [cortex] section is the single source; missing,
+    unreadable, or invalid values fall back to 20 minutes.
+    """
+    p = marrow_config_dir(cfg) / "config.toml"
+    try:
+        if p.is_file():
+            with p.open("rb") as f:
+                raw = (tomllib.load(f).get("cortex") or {}).get(
+                    "away_idle_min", DEFAULT_AWAY_IDLE_MIN)
+            value = int(raw)
+            if value >= 0:
+                return value
+    except (OSError, ValueError, TypeError):
+        pass
+    return DEFAULT_AWAY_IDLE_MIN
+
+
 def shell_id(cfg: dict) -> str:
     """The shell this cortex process drives ([daemon].shell, default 'cli') —
     the breaker scope and the value stamped on its ct_wake_log rows."""
@@ -255,12 +298,15 @@ def shell_id(cfg: dict) -> str:
 
 def wake_clamps(cfg: dict) -> dict[str, int]:
     """The wake-clamp numbers rendered into note/tool text (never hardcoded).
-    lie_down bounds [0, next_wake_max] from [wake]; idle bar from
+    lie_down's two legal bands from [wake] — next_wake_min..next_wake_low_max
+    and next_wake_high_min..next_wake_max; idle bar from
     [wake.watchdog].silent_max_min."""
     w = cfg.get("wake", {})
     wd = w.get("watchdog", {})
     return {
         "next_wake_min": 0,
+        "next_wake_low_max": int(w.get("next_wake_low_max", 55)),
+        "next_wake_high_min": int(w.get("next_wake_high_min", 180)),
         "next_wake_max": int(w.get("next_wake_max", 360)),
         "silent_max_min": int(wd.get("silent_max_min", 20)),
     }
@@ -401,6 +447,26 @@ def shell_state_dir(cfg: dict) -> Path:
     if raw:
         return Path(raw).expanduser()
     return marrow_db_path(cfg).parent / "state" / "shells"
+
+
+def shell_socket_path(cfg: dict, shell: str = "tg") -> Path | None:
+    """Kick socket of a non-cli shell host. marrow's [cortex].shell_socket owns
+    that single path and it belongs to the tg bridge, so any other shell has
+    none: None (the caller skips the kick and the host reads its ledger on the
+    next recompute tick). Empty/unreadable config -> <shell_state_dir>/tg.sock."""
+    if shell != "tg":
+        return None
+    raw = ""
+    p = marrow_config_dir(cfg) / "config.toml"
+    try:
+        if p.is_file():
+            with p.open("rb") as f:
+                data = tomllib.load(f)
+            raw = str((data.get("cortex") or {}).get("shell_socket") or "").strip()
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("shell_socket_path: marrow config read failed (%s) — "
+                       "using the default path", e)
+    return Path(raw).expanduser() if raw else shell_state_dir(cfg) / f"{shell}.sock"
 
 
 def cortex_home(cfg: dict) -> Path:

@@ -24,9 +24,9 @@ health_export = ""
 affect_flag_file = ""
 # Self-schedule queue (JSON list of {due_at}). Default: ~/.config/marrow/cortex/state/self_schedule.json
 self_schedule_file = ""
-# Handoff note the cli shell reads/writes (assistant's handoff; per-shell rolling
-# log, mirror of marrow [cortex].handoff_file_pattern).
-# Default: ~/.config/marrow/cortex/handoff-cli.md
+# Handoff note every shell reads/writes (assistant's handoff; one rolling log,
+# mirror of marrow [cortex].handoff_file).
+# Default: ~/.config/marrow/cortex/handoff.md
 handoff_file = ""
 # Cortex session cwd (own CLAUDE.md lives here). Default: ~/.config/marrow/cortex
 cortex_home = ""
@@ -105,7 +105,12 @@ receipt_ttl_min = 15
 # say() = the ONLY place cortex takes focus: it fronts the resident window and
 # plays a system sound (name of a /System/Library/Sounds/*.aiff; "" = silent).
 say_sound = "Glass"
-next_wake_max = 360         # lie_down(next_wake_min=N) clamp upper bound (minutes); lower bound is 0 (immediate re-wake) at every hour
+# lie_down(next_wake_min=N) legal minutes: two bands at every hour — [0, next_wake_low_max]
+# and [next_wake_high_min, next_wake_max] (0 = immediate re-wake). The gap between the bands
+# is unselectable: a choice landing there snaps silently to the nearer band edge.
+next_wake_max = 360
+next_wake_low_max = 55
+next_wake_high_min = 180
 # Minutes until the next wake when no caller picked one (proxy lie_down, daemon/
 # ctl/reconcile re-arm after a failed round). Cross-repo interval contract: keep
 # equal to [wake.watchdog].silent_max_min and synapse tg [cortex].shell_idle_min.
@@ -132,7 +137,7 @@ ctl_sleep_marker = "⚙️ [CTL]"
 [wake.watchdog]
 poll_sec = 60
 silent_max_min = 20            # silence cycle (same bar for chat or no-user wake): at this silence, inject one free-round note + marker, then re-arm the same timer
-fuse_tokens = 180000           # window tokens >= this -> esc + proxy lie_down (fuse); marrow's soft nudge (usage.show_tokens, 160k) fires first
+fuse_tokens = 300000           # window tokens >= this -> esc + proxy lie_down (fuse); marrow's soft nudge (cortex_rotate.show_tokens) fires first
 # Process-level hard interrupt (SIGINT), a guaranteed esc-equivalent for when the
 # osascript esc may not land (no window focus). Fires after esc on the fuse
 # path, only if the transcript is still growing past the grace window.
@@ -202,11 +207,11 @@ max_reasons = 8                # cap the pending-flag list (stuck bridge guard)
 wake_machine_tag = "[AUTOMATED WAKE SIGNAL — Note delivered by the scheduler]"
 title = ""                   # first line of the wakeup note, e.g. a nickname for the note; empty hides it
 pending_window_min = 15      # surface a self-schedule entry only when due within this window
-pause_tag = "(paused: {reason})"  # appended to the "Now: … | Last active: …" line while the circuit breaker covers THIS shell. {reason} = manual/auto_fuse, {scope} = all/cli/tg; "" omits the tag
+pause_tag = "(paused: {reason})"  # appended to the "🐆 Cortex last wake: …" line while the circuit breaker covers THIS shell. {reason} = manual/auto_fuse, {scope} = all/cli/tg; "" omits the tag
 handoff_title = "碎碎念"   # title of the handoff-note section (customisable display name)
 handoff_wake_kinds = ["rotate"]  # wake kinds that get the handoff (fresh window only)
 cadence_bin = ""             # cadence CLI for cal/rem lines; empty = packaged default path
-turn_end_text = ""           # one-line reminder appended at the end of every rendered note; "" omits it (the silence cycle already carries this). {next_wake_min}/{next_wake_max}/{silent_max_min} render from the wake clamps
+turn_end_text = ""           # one-line reminder appended at the end of every rendered note; "" omits it (the silence cycle already carries this). {next_wake_min}/{next_wake_low_max}/{next_wake_high_min}/{next_wake_max}/{silent_max_min} render from the wake clamps
 receipt_line = 'Note #{id} ({channel} {sent_hm}): she replied {replied_hm} "{text}"'  # reply-receipt line (C11); one per note she replied to since last note. {id}/{channel}/{sent_hm}/{replied_hm}/{text} from the outbox row; "" omits receipts
 # Header written into a freshly-created wishlist.md (append-only; never overwritten). Display text — customise freely.
 wishlist_header = "# Wishlist\n\n(owed treats / wants / self-rewards — append-only)\n"
@@ -228,3 +233,16 @@ reconcile_interval_sec = 60    # reconcile cadence (also the scheduler's max sle
 safety_horizon_sec = 300       # business re-arm gap when nothing is pending
 retry_interval_sec = 60        # business re-arm gap after a held/failed fire (anti-spin)
 lock_path = ""                 # singleton lock; "" -> <cortex_home>/state/daemon.lock
+
+# Duty rotation — at most one cortex shell on duty, the other held. State lives
+# in duty.json beside breaker.json (mode = intent, hold = pause scope);
+# enforcement takes the union of breaker.json and that hold.
+[duty]
+fresh_token_threshold = 80000  # incoming shell spawns fresh (not resumed) above this window occupancy
+fresh_age_hours = 8            # …or when its last activity is older than this
+# Source line leading the wakeup note of a shell woken BY a duty rotation.
+# {from_shell} = shell the transfer came from, {shell} = shell now on duty,
+# {hold} = the hold it materialised. "" omits the line; auto wakes carry none.
+transfer_source_text = "🔄 transferred from {from_shell} | {shell} on, {hold} hold"
+ctl_source_text = "Kicked by /ct-duty - {shell} on, {hold} hold"
+hold_none_label = "no"         # rendered for {hold} when the mode holds nothing

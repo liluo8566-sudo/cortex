@@ -16,17 +16,19 @@ Assumes [marrow](../marrow) + synapse already installed and a Claude Code max pl
    cp config.example.toml ~/.config/marrow/cortex.toml
    ```
    Override the path with the `CORTEX_CONFIG` env var if needed.
-3. Enable the marrow-side bridge: set `[cortex] enabled = true` in marrow's config.toml and list the shells that run as cortex shells in `[cortex] shells` (default `["cli"]`) — this repo reads that same key directly, no cortex.toml copy needed — then restart the marrow watcher. This installs the MCP tools (`lie_down` for every shell, `say` for the cli shell; `wish` / `first` / `goal` everywhere) and the wake hooks.
+3. Enable the marrow-side bridge: set `[cortex] enabled = true` in marrow's config.toml and list the shells that run as cortex shells in `[cortex] shells` (default `["cli"]`) — this repo reads that same key directly, no cortex.toml copy needed — then restart the marrow watcher. This installs the MCP tools (`lie_down` / `transfer` for every listed shell, `say` for the cli shell; `wish` / `first` / `goal` everywhere) and the wake hooks.
 4. Seed the cortex home dir `~/.config/marrow/cortex/` (configurable via `[paths] cortex_home`) — this is the resident session's cwd and inner world. Copy [templates/](templates/) there and customise names/paths:
    ```
    cp templates/*.md ~/.config/marrow/cortex/
    ```
    - `CLAUDE.md` — world rules + house rules for the resident session
    - `playbook.md` — activity menu (what to do when awake)
-   - `notebook.md` — long-term memory, self-maintained
-   - `handoff_template.md` — page template for the rolling log (per shell, `handoff-<shell>.md`; a page over `handoff_max_lines` is archived and a fresh page carries the unchecked todos + last lines)
+   - `desire.md` — drive system that steers activity choice while roaming
+   - `notebook.md` / `secret.md` — long-term memory, self-maintained
+   - `handoff.md` (`[cortex].handoff_file`) — one rolling log shared by every shell listed in `[cortex] shells`.
+   - `handoff_template.md` — master copy for the page turn; keep it in place. A page over `handoff_max_lines` is archived and this file is copied into a fresh page carrying the unchecked todos + last lines. Missing template = the page turn silently no-ops and the log grows forever. Its `## 待办` / `## 日志` / `### 前情` headings are the code↔template contract (`handoff_*_heading`); rename them in config if you rewrite the page.
    - `wishlist.md` — created automatically on first `wish`; template optional
-   Everything else under cortex_home (wakeup_note, wake_state, handoff-cli.md, logs) is generated at runtime.
+   Everything else under cortex_home (wakeup_note, wake_state, logs) is generated at runtime.
 5. Install the launchd jobs (collect-tick + wake-daemon):
    ```
    .venv/bin/python -m cortex.install

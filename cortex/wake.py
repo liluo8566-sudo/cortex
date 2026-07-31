@@ -225,7 +225,12 @@ def _classify_wake(cfg) -> tuple[str, bool]:
     if window.find_claude_pid(cfg) is None:
         return "resume", False  # session alive but claude died -> resume same conversation
     prev = wake_state.load(cfg).get("transcript")
-    cur = transcript.newest(cfg)
+    # Window-lineage resolution, not bare newest: the headless shells (marrow's
+    # sessionend digest, the tg cortex) write into the SAME projects dir, so any
+    # of their jsonls being mtime-newest made cur != prev and respawned a
+    # perfectly healthy window as "fresh". Only a genuine window session (wake
+    # marker in its first message) may drive that comparison.
+    cur = transcript.window_transcript(cfg)
     cur = str(cur) if cur else None
     # A None recorded hint means the last spawn timed out before the new session
     # jsonl appeared (see _spawn_wake). The window is alive with no rotate flag,
@@ -579,7 +584,7 @@ def _window_wake(conn, cfg, note_text, now, respawn: bool = False,
                 return landed
     except window.WindowError:
         return None
-    tpath = transcript.newest(cfg)
+    tpath = transcript.resident_transcript(cfg)
     # Wake-row commit AFTER the conditional set_awake succeeds (P2 fix): this is
     # the one set_awake call with a real reject path (expected_token — a user
     # message flipping awake first between the ear signal and here). Writing
@@ -613,7 +618,7 @@ def _ear_miss_ladder(conn, cfg, now, timeout: float,
         _audit_wake(conn, wake_id_of(now), "ear miss -> rearm (type signal)")
         before = transcript.mtime(cfg)
         if window.type_wake_signal(cfg, now) and _signal_landed(cfg, before, timeout):
-            tpath = transcript.newest(cfg)
+            tpath = transcript.resident_transcript(cfg)
             wake_state.set_awake(cfg, _wake_log_id(conn, now, wake_reasons),
                                  str(tpath) if tpath else None)
             watchdog.spawn(cfg)

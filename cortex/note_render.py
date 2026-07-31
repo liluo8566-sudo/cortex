@@ -10,11 +10,12 @@ shell ledger writes, no Replay (marrow's turn_inject is the single replay
 channel). --transcript supplies the Window-line SID (Path(...).stem[:8]) — the
 caller's own transcript, correct even after rotation. Print the note; exit 0.
 
---mirror is the ONE opt-in write: it also stores the rendered note in this
-shell's section of the on-disk wakeup note (note_file.write_section, other
-shells untouched). Every shell that renders through this entry — marrow's
-injection path and the synapse-tg shell host — gets its own attributed section
-from the same code, so no repo has to duplicate the file format.
+--mirror marks the DELIVERING render — the marrow injection hook and the
+synapse-tg shell host both pass it, and nothing else does. It stores the rendered
+note in this shell's section of the on-disk wakeup note (note_file.write_section,
+other shells untouched), so no repo has to duplicate that file format, and it
+consumes the one-shot duty wake-source line. A render without it stays a peek:
+the line survives for whichever render actually reaches the session.
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ def main() -> None:
     conn = db.connect(cfg)
     try:
         data = note.gather(conn, cfg, now, window_sid=window_sid,
-                           shell=args.shell)
+                           shell=args.shell, consume_source=args.mirror)
         if args.no_ct:
             data["ct_notes"] = []
         text = note.render(cfg, now, data)

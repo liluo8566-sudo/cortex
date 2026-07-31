@@ -1090,20 +1090,20 @@ def test_lie_down_returns_next_wake_hm(cfg):
     conn.close()
     wake_state.set_awake(cfg, wid, None)
 
-    # 120 is within [next_wake_min=21, next_wake_max=360] -> used verbatim.
-    r = lie_down.lie_down(cfg, next_wake_min=120)
+    # 200 sits inside the high band [180, 360] -> used verbatim.
+    r = lie_down.lie_down(cfg, next_wake_min=200)
     assert "next_wake" in r
     tz = config.get_tz(cfg)
-    expected = (_dt.now(tz) + timedelta(minutes=120)).strftime("%H:%M")
+    expected = (_dt.now(tz) + timedelta(minutes=200)).strftime("%H:%M")
     # allow a 1-min clock-tick skew
     assert r["next_wake"] in (
         expected,
-        (_dt.now(tz) + timedelta(minutes=121)).strftime("%H:%M"))
+        (_dt.now(tz) + timedelta(minutes=201)).strftime("%H:%M"))
 
 
 def test_lie_down_clamps_next_wake_min_to_ceiling(cfg):
-    """lie_down(next_wake_min=N) clamps to [0, next_wake_max=360] — the
-    session-facing window, not the interval itself. 999 -> 360."""
+    """lie_down(next_wake_min=N) clamps to the band ceiling next_wake_max=360 —
+    the session-facing window, not the interval itself. 999 -> 360."""
     from datetime import datetime as _dt
 
     conn = db.connect(cfg)
@@ -1120,6 +1120,78 @@ def test_lie_down_clamps_next_wake_min_to_ceiling(cfg):
     expected = (_dt.now(tz) + timedelta(minutes=360)).strftime("%H:%M")
     assert r["next_wake"] in (
         expected, (_dt.now(tz) + timedelta(minutes=361)).strftime("%H:%M"))
+
+
+_BANDS = {"wake": {"next_wake_low_max": 55, "next_wake_high_min": 180,
+                   "next_wake_max": 360}}
+
+
+@pytest.mark.parametrize("given,expected", [
+    (0, 0), (30, 30), (55, 55),          # low band passes through
+    (56, 55), (117, 55),                 # dead zone, nearer the low edge
+    (118, 180), (179, 180),              # dead zone, nearer the high edge
+    (180, 180), (300, 300), (360, 360),  # high band passes through
+    (999, 360), (-30, 0),                # out of range clamps to the edges
+])
+def test_clamp_next_wake_minutes_two_bands(given, expected):
+    """The legal minutes are two bands, 0-low_max and high_min-max. Anything in
+    the gap snaps to the nearer edge; nothing is ever rejected."""
+    assert lie_down.clamp_next_wake_minutes(given, _BANDS) == expected
+
+
+@pytest.mark.parametrize("given", [90, 120, 179, 999, -30])
+def test_clamp_next_wake_minutes_human_override_pierces_bands(given):
+    """An explicit human choice pierces the bands entirely — even a dead-zone
+    or out-of-range value passes through untouched."""
+    assert lie_down.clamp_next_wake_minutes(
+        given, _BANDS, human_override=True) == given
+
+
+def test_clamp_next_wake_minutes_defaults_without_config():
+    """Missing [wake] keys fall back to the code defaults, same two bands."""
+    assert lie_down.clamp_next_wake_minutes(117, {}) == 55
+    assert lie_down.clamp_next_wake_minutes(118, {}) == 180
+    assert lie_down.clamp_next_wake_minutes(999, {}) == 360
+
+
+def test_lie_down_snaps_dead_zone_minutes_to_a_band_edge(cfg):
+    """A dead-zone choice reaches the ledger already snapped: 90 -> 55."""
+    from datetime import datetime as _dt
+
+    conn = db.connect(cfg)
+    conn.execute(
+        "INSERT INTO ct_wake_log (ts, wake, dry_run, explanation) VALUES (?,1,0,?)",
+        (db.utcnow_iso(), "snap"))
+    conn.commit()
+    wid = conn.execute("SELECT MAX(id) AS id FROM ct_wake_log").fetchone()["id"]
+    conn.close()
+    wake_state.set_awake(cfg, wid, None)
+
+    r = lie_down.lie_down(cfg, next_wake_min=90)
+    tz = config.get_tz(cfg)
+    assert r["next_wake"] in (
+        (_dt.now(tz) + timedelta(minutes=55)).strftime("%H:%M"),
+        (_dt.now(tz) + timedelta(minutes=56)).strftime("%H:%M"))
+
+
+def test_lie_down_human_override_keeps_dead_zone_minutes(cfg):
+    """human_override=True: an explicit 90 stays 90, bands not applied."""
+    from datetime import datetime as _dt
+
+    conn = db.connect(cfg)
+    conn.execute(
+        "INSERT INTO ct_wake_log (ts, wake, dry_run, explanation) VALUES (?,1,0,?)",
+        (db.utcnow_iso(), "pierce"))
+    conn.commit()
+    wid = conn.execute("SELECT MAX(id) AS id FROM ct_wake_log").fetchone()["id"]
+    conn.close()
+    wake_state.set_awake(cfg, wid, None)
+
+    r = lie_down.lie_down(cfg, next_wake_min=90, human_override=True)
+    tz = config.get_tz(cfg)
+    assert r["next_wake"] in (
+        (_dt.now(tz) + timedelta(minutes=90)).strftime("%H:%M"),
+        (_dt.now(tz) + timedelta(minutes=91)).strftime("%H:%M"))
 
 
 def test_lie_down_zero_is_immediate_rewake(cfg):

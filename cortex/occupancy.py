@@ -235,7 +235,7 @@ def schedule_next_wake(now: datetime, config: dict,
 def lie_down(conn: sqlite3.Connection, cfg: dict, now: datetime | None = None,
              minutes: float | None = None) -> datetime:
     """Mark wake end (C-wm) and pick the next internal wake. `minutes` = an
-    explicit choice (pre-clamped by the caller to [0, next_wake_max] via
+    explicit choice (pre-normalised into the legal wake bands by the caller via
     clamp_next_wake_minutes, not re-clamped here); None = [wake].default_sleep_min.
     The clock restarts from lie-down. Called when a wake finishes — including on
     wake failure, so a crashed wake can't wedge it.

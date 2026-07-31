@@ -94,23 +94,32 @@ def _record_tokens(conn, cfg: dict, state: dict, force_slept: str | None) -> int
 
 def clamp_next_wake_minutes(minutes: float, config: dict,
                             human_override: bool = False) -> float:
-    """Clamp a lie_down(next_wake_min=N) choice to [0, wake.next_wake_max] —
-    one merged band for every hour (0 = immediate re-wake, e.g. a rotate
-    starting the successor window right away). `human_override` (explicit ctl
-    minutes) passes unclamped. Proxy paths pass None and skip this clamp."""
+    """Normalise a lie_down(next_wake_min=N) choice into the two legal wake
+    bands from [wake] — a low band up from zero and a high band up to the
+    ceiling, the same for every hour (0 = immediate re-wake, e.g. a rotate
+    starting the successor window right away). The gap between the bands is
+    unselectable: a value landing there snaps to the nearer edge, never an
+    error. `human_override` (explicit ctl minutes) passes untouched. Proxy
+    paths pass None and skip this clamp."""
     if human_override:
         return minutes
     wcfg = config.get("wake", {})
     hi = wcfg.get("next_wake_max", 360)
-    return max(0, min(hi, minutes))
+    low_max = wcfg.get("next_wake_low_max", 55)
+    high_min = wcfg.get("next_wake_high_min", 180)
+    minutes = max(0, min(hi, minutes))
+    if low_max < minutes < high_min:
+        minutes = low_max if minutes <= (low_max + high_min) / 2 else high_min
+    return minutes
 
 
 def lie_down(cfg: dict, force_slept: str | None = None, rotate: bool = False,
              next_wake_min: float | None = None,
              human_override: bool = False, book_alarm: bool = True) -> dict:
     """End the current wake. `next_wake_min` picks the next internal wake: an
-    explicit minutes-from-now, clamped to [0, next_wake_max] regardless of hour
-    (0 = immediate re-wake) — or None = [wake].default_sleep_min (proxy paths:
+    explicit minutes-from-now, normalised into the two legal wake bands
+    regardless of hour (0 = immediate re-wake) — or None =
+    [wake].default_sleep_min (proxy paths:
     stale, fuse; N is required at the MCP/CLI layer). `rotate` respawns a fresh
     window next wake. `human_override` (explicit ctl minutes) passes
     next_wake_min unclamped. `book_alarm=False` books NO next wake at all
@@ -282,9 +291,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="respawn a fresh window on the next wake")
     parser.add_argument("--next-wake-min", type=float, required=True,
                         help="minutes until the next internal wake (required, "
-                             "clamped to [0, next_wake_max])")
+                             "normalised into the legal wake bands)")
     parser.add_argument("--human-override", action="store_true",
-                        help="explicit ctl minutes pass unclamped")
+                        help="explicit ctl minutes pass untouched")
     args = parser.parse_args(argv)
     cfg = config.load()
     result = lie_down(cfg, force_slept=args.force_slept, rotate=args.rotate,

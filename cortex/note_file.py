@@ -6,11 +6,11 @@ it was. The file is now sectioned:
 
     ## cli · sid=45ce3c2c
     [AUTOMATED WAKE SIGNAL — ...]
-    Now: 20:19 Mon | Last active: 3min ago
+    🐆 Cortex last wake: 3m ago | 💻 Mac is Active: iTerm2
 
     ## tg · sid=5982c26a
     [AUTOMATED WAKE SIGNAL — ...]
-    Now: 20:21 Mon | Last active: 1min ago
+    🐆 Cortex last wake: 1m ago | 💻 Mac is Active: Telegram
 
 Rules: the heading is DISPLAY-ONLY (never part of injected text); no blank line
 inside a section body; one blank line between sections; existing sections keep

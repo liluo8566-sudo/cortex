@@ -29,6 +29,16 @@ def cfg(tmp_path):
     return c
 
 
+@pytest.fixture(autouse=True)
+def no_real_macos_probes(monkeypatch):
+    """Every macOS probe is explicitly mocked by the test that exercises it."""
+    def fail(*_args, **_kwargs):
+        raise OSError("real macOS probe disabled in tests")
+
+    monkeypatch.setattr(note.ctypes, "CDLL", fail)
+    monkeypatch.setattr(note.subprocess, "run", fail)
+
+
 def make_events_table(conn):
     conn.execute(
         "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, "
@@ -90,17 +100,19 @@ def test_render_full_note(cfg):
         "wake_parts": ["wander"],
         "last_wake": {"minutes_ago": 12, "force_slept": None},
         "last_active": {"minutes_ago": 12},
-        "active_app": "Google Chrome",
+        "computer": {
+            "state": "active", "app": "Google Chrome", "idle_seconds": 60,
+        },
         "pending": [{"hm": "00:18", "intent": "去看看老婆睡了没"}],
     }
     text = note.render(cfg, NOW, data)
     assert "Wake:" not in text  # reason line retired
     assert "Now:" not in text  # Now line deleted — hook injects current time
-    assert text.startswith("🐆 Last active: 12min ago | 💻 Current active: Google Chrome")
+    assert text.startswith("🐆 Cortex last wake: 12m ago | 💻 Mac is Active: Google Chrome")
     assert "Plan Used" not in text  # budget line retired
     # header = exactly the merged line above, nothing else
     assert text.split("\n\n---\n\n")[0].split("\n") == [
-        "🐆 Last active: 12min ago | 💻 Current active: Google Chrome",
+        "🐆 Cortex last wake: 12m ago | 💻 Mac is Active: Google Chrome",
     ]
     assert "Pending self-schedule: due 00:18 去看看老婆睡了没" in text
     # block separators
@@ -114,7 +126,7 @@ def test_render_omits_absent_lines(cfg):
     assert "Wake:" not in text  # reason line retired
     assert "Now:" not in text  # Now line deleted
     assert text == ""  # nothing to report -> empty header, no lines at all
-    assert "Last active:" not in text
+    assert "Cortex last wake:" not in text
     assert "Plan Used:" not in text
     assert "Active (Mac):" not in text
     assert "Pending" not in text
@@ -394,7 +406,7 @@ def test_render_pause_tag_from_breaker(cfg):
     data = {"last_wake": {"minutes_ago": 40, "force_slept": None},
             "paused": {"reason": "manual", "scope": "cli"}}
     text = note.render(cfg, NOW, data)
-    assert "Last active: 40min ago (paused: manual)" in text
+    assert "Cortex last wake: 40m ago (paused: manual)" in text
 
 
 def test_render_no_pause_tag_when_breaker_clear(cfg):
@@ -402,7 +414,7 @@ def test_render_no_pause_tag_when_breaker_clear(cfg):
     is the cli window's own shutdown ledger, not a per-shell pause state."""
     data = {"last_wake": {"minutes_ago": 40, "force_slept": "timeout"}}
     text = note.render(cfg, NOW, data)
-    assert "Last active: 40min ago" in text
+    assert "Cortex last wake: 40m ago" in text
     assert "force-slept" not in text and "paused" not in text
 
 
@@ -529,10 +541,10 @@ def test_paused_is_per_shell(cfg, tmp_path):
 
 def test_render_last_active_falls_back_to_wake_minutes(cfg):
     """No last_active -> the line uses the wake row's minutes and keeps the
-    'Last active:' label."""
+    'Cortex last wake:' label."""
     data = {"last_wake": {"minutes_ago": 22, "force_slept": "timeout"}}
     text = note.render(cfg, NOW, data)
-    assert "Last active: 22min ago" in text
+    assert "Cortex last wake: 22m ago" in text
 
 
 def test_render_last_active_overrides_wake_minutes(cfg):
@@ -542,7 +554,7 @@ def test_render_last_active_overrides_wake_minutes(cfg):
         "last_active": {"minutes_ago": 3},
     }
     text = note.render(cfg, NOW, data)
-    assert "Last active: 3min ago" in text
+    assert "Cortex last wake: 3m ago" in text
 
 
 def test_pending_within_window(cfg, tmp_path, monkeypatch):
@@ -584,12 +596,16 @@ def test_pending_naive_aware_and_garbage_mixed(cfg, tmp_path, monkeypatch):
     ]
 
 
-def test_frontmost_app_locked_returns_none(monkeypatch):
+def test_frontmost_app_loginwindow_returns_none(monkeypatch):
     class FakeProc:
         returncode = 0
         stdout = "loginwindow\n"
-    monkeypatch.setattr(note.subprocess, "run", lambda *a, **k: FakeProc())
+    calls = []
+    monkeypatch.setattr(
+        note.subprocess, "run",
+        lambda *a, **k: calls.append((a, k)) or FakeProc())
     assert note._frontmost_app() is None
+    assert calls[0][0][0][0] == "/usr/bin/osascript"
 
 
 def test_frontmost_app_failure_returns_none(monkeypatch):
@@ -603,8 +619,149 @@ def test_frontmost_app_ok(monkeypatch):
     class FakeProc:
         returncode = 0
         stdout = "WeChat\n"
-    monkeypatch.setattr(note.subprocess, "run", lambda *a, **k: FakeProc())
+    calls = []
+    monkeypatch.setattr(
+        note.subprocess, "run",
+        lambda *a, **k: calls.append((a, k)) or FakeProc())
     assert note._frontmost_app() == "WeChat"
+    assert calls[0][0][0][0] == "/usr/bin/osascript"
+
+
+class _CFunc:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *args):
+        return self.fn(*args)
+
+
+@pytest.mark.parametrize(("on_console", "locked", "expected"), [
+    (True, False, False),
+    (True, None, False),
+    (True, True, True),
+    (False, False, True),
+    (None, False, None),
+])
+def test_screen_locked_reads_coregraphics(
+        monkeypatch, on_console, locked, expected):
+    releases = []
+    cg = type("CG", (), {})()
+    cf = type("CF", (), {})()
+    cg.CGSessionCopyCurrentDictionary = _CFunc(lambda: 1)
+    cf.CFStringCreateWithCString = _CFunc(
+        lambda _allocator, name, _encoding:
+            {b"kCGSSessionOnConsoleKey": 2,
+             b"CGSSessionScreenIsLocked": 3}[name])
+    cf.CFDictionaryGetValue = _CFunc(
+        lambda _session, key:
+            None if ((key == 2 and on_console is None)
+                     or (key == 3 and locked is None))
+            else {2: 4, 3: 5}[key])
+    cf.CFBooleanGetValue = _CFunc(
+        lambda value: {4: on_console, 5: locked}[value])
+    cf.CFRelease = _CFunc(releases.append)
+    monkeypatch.setattr(
+        note.ctypes, "CDLL",
+        lambda path: cg if path == note._APPLICATION_SERVICES else cf)
+
+    assert note._screen_locked() is expected
+    expected_releases = [2, 1] if on_console is None else [2, 3, 1]
+    assert releases == expected_releases
+
+
+def test_screen_locked_ctypes_failure_returns_none(monkeypatch):
+    def fail(_path):
+        raise OSError("CoreGraphics unavailable")
+
+    monkeypatch.setattr(note.ctypes, "CDLL", fail)
+    assert note._screen_locked() is None
+
+
+@pytest.mark.parametrize(("stdout", "returncode", "expected"), [
+    ('    | |   "HIDIdleTime" = 2400000000000\n', 0, 2400),
+    ('    | |   "Other" = 1\n', 0, None),
+    ('', 1, None),
+])
+def test_idle_seconds_parses_ioreg(monkeypatch, stdout, returncode, expected):
+    proc = type("Proc", (), {"stdout": stdout, "returncode": returncode})()
+    calls = []
+    monkeypatch.setattr(
+        note.subprocess, "run",
+        lambda *a, **k: calls.append((a, k)) or proc)
+    assert note._idle_seconds() == expected
+    assert calls[0][0][0] == ["/usr/sbin/ioreg", "-c", "IOHIDSystem"]
+
+
+def test_idle_seconds_subprocess_failure_returns_none(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise OSError("ioreg unavailable")
+
+    monkeypatch.setattr(note.subprocess, "run", fail)
+    assert note._idle_seconds() is None
+
+
+def test_computer_status_locked_does_not_report_app(cfg, monkeypatch):
+    monkeypatch.setattr(note, "_screen_locked", lambda: True)
+    monkeypatch.setattr(note, "_idle_seconds", lambda: 12 * 3600 + 59 * 60)
+
+    def fail():
+        raise AssertionError("locked state must not probe the app")
+
+    monkeypatch.setattr(note, "_frontmost_app", fail)
+    assert note._computer_status(cfg) == {
+        "state": "locked", "idle_seconds": 12 * 3600 + 59 * 60,
+    }
+
+
+def test_computer_status_lock_failure_degrades_to_unlocked(cfg, monkeypatch):
+    monkeypatch.setattr(note, "_screen_locked", lambda: None)
+    monkeypatch.setattr(note, "_idle_seconds", lambda: 40 * 60)
+    monkeypatch.setattr(note, "_frontmost_app", lambda: "Code")
+    monkeypatch.setattr(note.config, "away_idle_min", lambda _cfg: 20)
+    assert note._computer_status(cfg) == {
+        "state": "away", "app": "Code", "idle_seconds": 40 * 60,
+    }
+
+
+@pytest.mark.parametrize(("idle_seconds", "state"), [
+    (20 * 60 - 1, "active"),
+    (20 * 60, "away"),
+])
+def test_computer_status_away_threshold(cfg, monkeypatch, idle_seconds, state):
+    monkeypatch.setattr(note, "_screen_locked", lambda: False)
+    monkeypatch.setattr(note, "_idle_seconds", lambda: idle_seconds)
+    monkeypatch.setattr(note, "_frontmost_app", lambda: "Code")
+    monkeypatch.setattr(note.config, "away_idle_min", lambda _cfg: 20)
+    assert note._computer_status(cfg)["state"] == state
+
+
+def test_computer_status_omitted_when_idle_fails(cfg, monkeypatch):
+    monkeypatch.setattr(note, "_screen_locked", lambda: False)
+    monkeypatch.setattr(note, "_idle_seconds", lambda: None)
+    assert note._computer_status(cfg) is None
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [
+    (40 * 60, "40m"),
+    (59 * 60 + 59, "59m"),
+    (60 * 60, "1h"),
+    (60 * 60 + 20 * 60, "1h20m"),
+    (12 * 60 * 60 + 59 * 60, "12h59m"),
+])
+def test_idle_duration(seconds, expected):
+    assert note._idle_duration(seconds) == expected
+
+
+@pytest.mark.parametrize(("computer", "expected"), [
+    ({"state": "locked", "idle_seconds": 12 * 3600},
+     "💻 Mac is Locked: 12h"),
+    ({"state": "away", "app": "Code", "idle_seconds": 40 * 60},
+     "💻 Mac is Inactive: 40m Code"),
+    ({"state": "active", "app": "Code", "idle_seconds": 5 * 60},
+     "💻 Mac is Active: Code"),
+])
+def test_render_computer_three_states(computer, expected):
+    assert note._render_computer(computer) == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -621,7 +778,7 @@ def test_gather_end_to_end(marrow_conn, cfg, tmp_path, monkeypatch):
         ("s", "2026-07-08T03:00:00+00:00", "user", "hi", "wx"))
     marrow_conn.commit()
 
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
 
     data = note.gather(marrow_conn, cfg, NOW, decision={
         "reasons": [_FloorReason()]})
@@ -668,7 +825,7 @@ def test_gather_survives_naive_due_at_self_schedule(marrow_conn, cfg, tmp_path, 
     make_events_table(marrow_conn)
     marrow_conn.commit()
 
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
 
     sp = tmp_path / "ss.json"
     naive_due = (NOW + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
@@ -767,21 +924,10 @@ def test_loc_duration_formatting(cfg):
     assert note._loc_duration(timedelta(minutes=135)) == "2h15m"
 
 
-def test_render_location_stale_no_signal(cfg, tmp_path, monkeypatch):
-    stale_last_seen = (NOW - timedelta(hours=26)).replace(tzinfo=None).isoformat()
-    _write_location(tmp_path, monkeypatch, {
-        "zone": "Deakin", "since": "2026-07-08T07:00:00", "seeded": False,
-        "prev": None, "last_seen": stale_last_seen,
-    })
-    loc = note._location(cfg)
-    text = note.render(cfg, NOW, {"location": loc})
-    assert "📍 Deakin (no signal 26h)" in text
-
-
 def test_render_locked_header_shape_tag_then_location_then_merged_line(cfg):
     """The exact locked header (coordinator spec): machine tag, then 📍, then
-    one merged "🐆 Last active ... | 💻 Current active ..." line — no "Now:"
-    line anywhere."""
+    one merged "🐆 Cortex last wake ... | 💻 Mac is Active ..." line — no
+    "Now:" line anywhere."""
     cfg["note"]["wake_machine_tag"] = (
         "[AUTOMATED WAKE SIGNAL — Note delivered by the scheduler]")
     data = {
@@ -791,22 +937,25 @@ def test_render_locked_header_shape_tag_then_location_then_merged_line(cfg):
             "last_seen": "2026-07-08T14:00:00",
         },
         "last_active": {"minutes_ago": 19},
-        "active_app": "Notion",
+        "computer": {"state": "active", "app": "Notion", "idle_seconds": 60},
     }
     text = note.render(cfg, NOW, data)
     assert text == (
         "[AUTOMATED WAKE SIGNAL — Note delivered by the scheduler]\n"
         "📍 08:30 Left Home → 09:00 Arrived Deakin (5h30m)\n"
-        "🐆 Last active: 19min ago | 💻 Current active: Notion"
+        "🐆 Cortex last wake: 19m ago | 💻 Mac is Active: Notion"
     )
 
 
 def test_render_location_omitted_when_no_state_active_line_unaffected(cfg):
     """No location state -> merged active line is still the first (only)
     header line — unchanged position logic, just no 📍 line."""
-    data = {"last_active": {"minutes_ago": 19}, "active_app": "Notion"}
+    data = {
+        "last_active": {"minutes_ago": 19},
+        "computer": {"state": "active", "app": "Notion", "idle_seconds": 60},
+    }
     text = note.render(cfg, NOW, data)
-    assert text == "🐆 Last active: 19min ago | 💻 Current active: Notion"
+    assert text == "🐆 Cortex last wake: 19m ago | 💻 Mac is Active: Notion"
     assert "📍" not in text
 
 
@@ -814,7 +963,7 @@ def test_render_merged_line_active_only_no_pipe(cfg):
     """No Active(Mac) app -> just the 🐆 half, no trailing pipe."""
     data = {"last_active": {"minutes_ago": 19}}
     text = note.render(cfg, NOW, data)
-    assert text == "🐆 Last active: 19min ago"
+    assert text == "🐆 Cortex last wake: 19m ago"
     assert "|" not in text
 
 
@@ -855,7 +1004,7 @@ def test_gather_window_sid_override(marrow_conn, cfg, tmp_path, monkeypatch):
     callers that pass window_sid (watchdog / note_render --transcript)."""
     make_events_table(marrow_conn)
     marrow_conn.commit()
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
     since = (NOW - timedelta(minutes=3)).astimezone(ZoneInfo("UTC")).isoformat()
     _isolate_wake_state(cfg, tmp_path, {
         "transcript": "/x/deadbeef00.jsonl", "awake_since": since})
@@ -870,7 +1019,7 @@ def test_gather_window_sid_falls_back_to_wake_state(marrow_conn, cfg, tmp_path, 
     """No override -> Window SID comes from wake_state.transcript (legacy path)."""
     make_events_table(marrow_conn)
     marrow_conn.commit()
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
     _isolate_wake_state(cfg, tmp_path, {"transcript": "/x/abcd1234ef.jsonl"})
 
     data = note.gather(marrow_conn, cfg, NOW)
@@ -881,7 +1030,7 @@ def test_gather_window_sid_only_when_wake_state_empty(marrow_conn, cfg, tmp_path
     """Override lands in the data even with no awake_since/no state."""
     make_events_table(marrow_conn)
     marrow_conn.commit()
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
     _isolate_wake_state(cfg, tmp_path, {})
 
     data = note.gather(marrow_conn, cfg, NOW, window_sid="cafe0001")
@@ -905,7 +1054,7 @@ def test_note_render_main_prints_fresh_note_no_writes(tmp_path, monkeypatch, cap
     _cfg["paths"]["wake_state_file"] = str(tmp_path / "ws.json")
     _cfg["paths"]["cortex_home"] = str(tmp_path / "home")
     monkeypatch.setattr(_config, "load", lambda path=None: _cfg)
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
     monkeypatch.setattr("sys.argv", ["note_render", "--transcript", "/t/feed1234ab.jsonl"])
 
     note_render.main()
@@ -939,7 +1088,7 @@ def _render_cli(tmp_path, monkeypatch, capsys, argv):
     _cfg["paths"]["wake_state_file"] = str(tmp_path / "ws.json")
     _cfg["paths"]["cortex_home"] = str(tmp_path / "home")
     monkeypatch.setattr(_config, "load", lambda path=None: _cfg)
-    monkeypatch.setattr(note, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(note, "_computer_status", lambda _cfg: None)
     monkeypatch.setattr("sys.argv", ["note_render", *argv])
 
     class _FrozenNow(datetime):          # a minute boundary must not flake this
@@ -1011,9 +1160,9 @@ def test_gather_render_scopes_wake_fallback_to_its_shell(marrow_conn, cfg):
         "VALUES (?, 1, 0, 'ct-pause', 'cli')", (ts,))
     marrow_conn.commit()
     tg_text = note.render(cfg, NOW, note.gather(marrow_conn, cfg, NOW, shell="tg"))
-    assert "Last active" not in tg_text
+    assert "Cortex last wake" not in tg_text
     cli_text = note.render(cfg, NOW, note.gather(marrow_conn, cfg, NOW, shell="cli"))
-    assert "Last active: 30min ago" in cli_text
+    assert "Cortex last wake: 30m ago" in cli_text
 
 
 def test_render_never_tags_force_slept(cfg):

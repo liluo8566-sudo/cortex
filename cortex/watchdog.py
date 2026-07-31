@@ -537,7 +537,7 @@ def _log(msg: str) -> None:
 def run(cfg: dict) -> int:
     wcfg = cfg["wake"].get("watchdog", {})
     poll = int(wcfg.get("poll_sec", 60))
-    fuse = int(wcfg.get("fuse_tokens", 180_000))
+    fuse = int(wcfg.get("fuse_tokens", 300_000))
     grace = float(wcfg.get("hard_interrupt_grace_sec", 30))
 
     _log(f"watchdog start pid={os.getpid()} poll={poll}s fuse={fuse}")

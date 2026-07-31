@@ -648,8 +648,9 @@ def clear_next_wake_at(cfg: dict) -> None:
 
 def set_rotated(cfg: dict) -> None:
     """Rotate flag: lie_down sets it when the window grew past the rotate line so
-    the NEXT wake respawns a fresh window (SIGTERM claude + fresh spawn)
-    instead of resuming the oversized one."""
+    the NEXT wake plans a fresh spawn instead of resuming the oversized session.
+    Nothing is killed — the predecessor window stays open for the user to
+    close, and retired_sid keeps every resume path off that session."""
     update(cfg, rotated=True)
 
 

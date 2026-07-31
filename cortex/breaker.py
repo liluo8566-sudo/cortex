@@ -48,9 +48,8 @@ DEFAULTS = {
     "window_hours": 24,
     "trip_message": (
         "Circuit breaker tripped: fuse #{count} within {hours}h. Cortex "
-        "autonomous activity paused ({scope}). Clear with ct-wake."
+        "autonomous activity paused ({scope}). Clear with ct-duty cli|tg|all."
     ),
-    "clear_message": "Circuit breaker cleared — cortex autonomous activity resumed.",
 }
 
 
@@ -142,22 +141,44 @@ def read(config_dir: Path | str) -> dict | None:
 
 
 def covers(config_dir: Path | str, shell: str) -> bool:
-    """Does the breaker hold `shell` down right now?"""
+    """Is `shell` held down right now — by the manual/fuse breaker scope OR by
+    the duty rotation hold? The two files are independent: duty never writes
+    breaker.json, so enforcement takes their union."""
+    target = str(shell).strip().lower()
     state = read(config_dir)
-    if state is None:
-        return False
-    return state["scope"] in (SCOPE_ALL, str(shell).strip().lower())
+    if state is not None and state["scope"] in (SCOPE_ALL, target):
+        return True
+    from cortex import duty
+    return duty.covers(config_dir, target)
+
+
+def _union(current: str | None, scope: str) -> str:
+    """Widest hold of the two: a second single-shell pause never releases the
+    shell the first one holds."""
+    if current is None or current == scope:
+        return scope
+    return SCOPE_ALL
 
 
 def trip(config_dir: Path | str, scope: str = SCOPE_ALL,
-         reason: str = REASON_MANUAL, *, now: datetime | None = None) -> dict:
-    """Write the breaker. Last writer wins — an auto trip and a manual pause
-    both mean 'stop', so there is nothing to merge."""
-    state = {"scope": str(scope).strip().lower() or SCOPE_ALL,
-             "reason": reason,
-             "ts": (now or datetime.now().astimezone()).isoformat()}
+         reason: str = REASON_MANUAL, *, now: datetime | None = None,
+         merge: bool = False) -> dict:
+    """Write the breaker. Last writer wins by default — the auto fuse trips
+    scope "all", which already covers everything standing.
+
+    `merge=True` (manual pause) unions the new scope with the standing one
+    instead: pausing tg while cli is held holds BOTH, and pausing one shell
+    while scope is "all" leaves "all" alone. `reason` is still the new writer's
+    — a merged manual pause reads as manual."""
     p = breaker_path(config_dir)
     with _flock(p):
+        target = str(scope).strip().lower() or SCOPE_ALL
+        if merge:
+            current = read(config_dir)
+            target = _union(current["scope"] if current else None, target)
+        state = {"scope": target,
+                 "reason": reason,
+                 "ts": (now or datetime.now().astimezone()).isoformat()}
         _write_json(p, state)
     return state
 
@@ -267,7 +288,7 @@ def state(cfg: dict) -> dict | None:
 
 
 def pause(cfg: dict, scope: str = SCOPE_ALL) -> dict:
-    return trip(_dir(cfg), scope, REASON_MANUAL)
+    return trip(_dir(cfg), scope, REASON_MANUAL, merge=True)
 
 
 def release(cfg: dict, shell: str | None = None) -> bool:

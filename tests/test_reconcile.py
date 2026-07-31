@@ -562,7 +562,6 @@ def test_window_alive_is_per_session(cfg, monkeypatch):
 def test_ctl_pause_resume(cfg, monkeypatch, capsys):
     from cortex import ctl
     monkeypatch.setattr(ctl.config, "load", lambda: cfg)
-    monkeypatch.setattr(ctl, "_receipt", lambda c, m: None)
     ctl.main(["pause"])
     assert breaker.holds(cfg, "cli") is True
     assert breaker.holds(cfg, "tg") is True
@@ -583,7 +582,6 @@ def test_ctl_resume_single_shell_narrows_an_all_hold(cfg, monkeypatch):
     cli stays held (no resume-then-pause-again dance)."""
     from cortex import ctl
     monkeypatch.setattr(ctl.config, "load", lambda: cfg)
-    monkeypatch.setattr(ctl, "_receipt", lambda c, m: None)
     ctl.main(["pause"])
     ctl.main(["resume", "--shell", "tg"])
     assert breaker.holds(cfg, "tg") is False
@@ -591,35 +589,20 @@ def test_ctl_resume_single_shell_narrows_an_all_hold(cfg, monkeypatch):
     assert "scope=cli" in ctl.cmd_status(cfg)
 
 
-def test_ctl_resume_single_shell_matching_scope_clears(cfg, monkeypatch):
+def test_ctl_resume_single_shell_matching_scope_clears(cfg):
     from cortex import ctl
-    monkeypatch.setattr(ctl, "_receipt", lambda c, m: None)
     breaker.pause(cfg, "tg")
     line = ctl.cmd_resume(cfg, "tg")
     assert breaker.state(cfg) is None
     assert "breaker OFF" in line and "still ON" not in line
 
 
-def test_ctl_resume_single_shell_other_scope_is_a_noop(cfg, monkeypatch):
+def test_ctl_resume_single_shell_other_scope_is_a_noop(cfg):
     from cortex import ctl
-    monkeypatch.setattr(ctl, "_receipt", lambda c, m: None)
     breaker.pause(cfg, "cli")
     line = ctl.cmd_resume(cfg, "tg")
     assert breaker.holds(cfg, "cli") is True
     assert "was not held" in line
-
-
-def test_ctl_resume_receipt_only_when_tg_is_freed(cfg, monkeypatch):
-    """The receipt is delivered on tg — releasing only cli must not tell tg
-    that autonomous activity resumed."""
-    from cortex import ctl
-    sent = []
-    monkeypatch.setattr(ctl, "_receipt", lambda c, m: sent.append(m))
-    breaker.pause(cfg, "all")
-    ctl.cmd_resume(cfg, "cli")
-    assert sent == []
-    ctl.cmd_resume(cfg, "tg")
-    assert len(sent) == 1
 
 
 def test_ctl_pause_puts_live_cli_window_down(cfg, monkeypatch):
