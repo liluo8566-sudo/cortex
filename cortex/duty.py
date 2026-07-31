@@ -347,14 +347,42 @@ def other_shell(shell: str) -> str | None:
     return next(x for x in SHELLS if x != s)
 
 
-def transfer(cfg: dict, shell: str) -> dict:
+def _retire_caller(cfg: dict, shell: str) -> None:
+    """Retire the CALLER's own window as it hands duty away: whenever duty comes
+    back to this shell it must spawn fresh, never resume the session being left
+    behind. The retirement is recorded on the caller's side only — the incoming
+    shell's wake is untouched and still judged by the fresh-vs-resume gate.
+
+    tg rides the ledger flag its host claims on the next kick; cli mirrors the
+    rotate writes of _wake_cli. Both must land BEFORE the caller's put-down:
+    lie_down's claim drops the `transcript` hint retired_sid is derived from."""
+    if shell == SHELL_TG:
+        from cortex import shell_ledger
+
+        shell_ledger.write(config.shell_state_dir(cfg), SHELL_TG,
+                           {"rotate_pending": True})
+        return
+    from cortex import wake_state
+
+    retiring = wake_state.load(cfg).get("transcript")
+    if retiring:
+        wake_state.set_retired_sid(cfg, retiring)
+    wake_state.set_rotated(cfg)
+
+
+def transfer(cfg: dict, shell: str, rotate: bool = False) -> dict:
     """Hand duty from `shell` to the other cortex shell — the on-duty shell's
     own graceful handover (marrow exposes it as the transfer MCP tool).
 
     Duty moves to mode = the target, so the caller's shell is what the new hold
     covers: it simply goes quiet where it stands, and the fresh-vs-resume gate
     judges its window at its own next takeover. Everything else is apply's
-    ordinary transition — no lie_down and no rotate are issued here.
+    ordinary transition — no lie_down is issued here.
+
+    `rotate` retires the CALLER's window on the way out (see _retire_caller), so
+    its own next takeover spawns fresh whatever the gate would have said. It runs
+    as apply's after_hold: under the duty lock, once the new hold is on disk and
+    before any put-down or kick.
 
     A standing breaker.json refuses: a manual/fuse pause outranks a rotation,
     and transfer must never clear it (only an explicit ctl duty does)."""
@@ -367,16 +395,22 @@ def transfer(cfg: dict, shell: str) -> dict:
     from cortex import wake_source
 
     out = apply(cfg, target, source=wake_source.KIND_TRANSFER,
-                from_shell=caller)
-    return {"ok": True, "shell": caller, "target": target, **out}
+                from_shell=caller,
+                after_hold=(lambda: _retire_caller(cfg, caller)) if rotate
+                else None)
+    return {"ok": True, "shell": caller, "target": target,
+            "rotated": bool(rotate), **out}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Duty rotation")
     parser.add_argument("--transfer", metavar="SHELL", required=True,
                         help="hand duty from SHELL to the other cortex shell")
+    parser.add_argument("--rotate", action="store_true",
+                        help="retire the calling shell's window on the way out")
     args = parser.parse_args(argv)
-    print(json.dumps(transfer(config.load(), args.transfer), ensure_ascii=False))
+    print(json.dumps(transfer(config.load(), args.transfer, rotate=args.rotate),
+                     ensure_ascii=False))
     return 0
 
 

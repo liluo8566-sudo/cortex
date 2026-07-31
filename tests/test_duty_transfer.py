@@ -105,6 +105,54 @@ def test_transfer_carries_the_fresh_gate(cfg, cdir, trace):
     assert wake_state.load(cfg)["rotated"] is True
 
 
+# --- caller rotation ----------------------------------------------------------
+
+def test_rotate_retires_the_tg_caller_in_its_ledger(cfg, cdir, trace):
+    from cortex import shell_ledger
+    duty.write(cdir, "tg")
+    res = duty.transfer(cfg, "tg", rotate=True)
+    assert res["ok"] is True and res["rotated"] is True
+    assert shell_ledger.read(config.shell_state_dir(cfg), "tg") == {
+        "rotate_pending": True}
+    assert trace == ["wake_cli"]
+
+
+def test_rotate_retires_the_cli_caller_before_its_put_down(cfg, cdir, trace):
+    duty.write(cdir, "cli")
+    wake_state.set_awake(cfg, 1, "/t/abc-123.jsonl")
+    res = duty.transfer(cfg, "cli", rotate=True)
+    assert res["ok"] is True and res["put_down"] is True
+    d = wake_state.load(cfg)
+    assert d["rotated"] is True and d["retired_sid"] == "abc-123"
+
+
+def test_rotate_never_touches_the_woken_shell(cfg, cdir, trace):
+    from cortex import shell_ledger
+    duty.write(cdir, "cli")
+    wake_state.set_awake(cfg, 1, None)
+    duty.transfer(cfg, "cli", rotate=True)
+    assert "rotate_pending" not in shell_ledger.read(
+        config.shell_state_dir(cfg), "tg")
+
+
+def test_default_transfer_retires_nobody(cfg, cdir, trace):
+    from cortex import shell_ledger
+    duty.write(cdir, "tg")
+    wake_state.set_awake(cfg, 1, "/t/abc-123.jsonl")
+    res = duty.transfer(cfg, "tg")
+    assert res["rotated"] is False
+    assert shell_ledger.read(config.shell_state_dir(cfg), "tg") == {}
+    d = wake_state.load(cfg)
+    assert d.get("rotated") is not True and d.get("retired_sid") is None
+
+
+def test_a_refused_transfer_retires_nothing(cfg, cdir, trace):
+    from cortex import shell_ledger
+    breaker.trip(cdir, "all", breaker.REASON_MANUAL)
+    duty.transfer(cfg, "tg", rotate=True)
+    assert shell_ledger.read(config.shell_state_dir(cfg), "tg") == {}
+
+
 # --- refusals ----------------------------------------------------------------
 
 def test_unknown_shell_refuses(cfg, cdir, trace):
@@ -146,6 +194,15 @@ def test_main_prints_the_outcome_as_json(cfg, cdir, trace, monkeypatch, capsys):
     assert duty.main(["--transfer", "tg"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True and out["target"] == "cli"
+
+
+def test_main_rotate_flag_reaches_the_caller(cfg, cdir, trace, monkeypatch, capsys):
+    from cortex import shell_ledger
+    monkeypatch.setattr(config, "load", lambda *a, **k: cfg)
+    assert duty.main(["--transfer", "tg", "--rotate"]) == 0
+    assert json.loads(capsys.readouterr().out)["rotated"] is True
+    assert shell_ledger.read(config.shell_state_dir(cfg), "tg") == {
+        "rotate_pending": True}
 
 
 def test_main_prints_a_refusal_as_json(cfg, cdir, trace, monkeypatch, capsys):
